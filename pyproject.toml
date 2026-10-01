@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sandwich3pb"
+version = "0.1.0"
+description = "3D three-point bending simulation of composite sandwich beams with FEniCSx/DOLFINx: rigid-roller contact, failure indices, and Markdown/HTML/PDF reporting."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "sandwich3pb contributors" }]
+keywords = ["fenicsx", "dolfinx", "finite-elements", "sandwich", "composite", "three-point-bending", "contact"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+# NOTE: dolfinx/petsc4py MUST come from conda-forge, not PyPI. Install this
+# package with `pip install -e .` inside the conda env from environment.yml.
+dependencies = [
+    "numpy",
+    "scipy",
+    "matplotlib",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-cov"]
+
+[project.scripts]
+sandwich3pb = "sandwich3pb.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/example/sandwich3pb"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

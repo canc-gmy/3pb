@@ -1,0 +1,74 @@
+# Glass/epoxy faceskins over PVC foam core — three-point bending
+# Units: mm, N, MPa
+
+name: glass_pvc_reference
+output_dir: results
+
+geometry:
+  length: 300        # overall beam length
+  span: 200          # distance between support rollers
+  width: 40          # beam width
+
+materials:
+  glass_epoxy:
+    kind: orthotropic
+    E1: 39000.0      # fibre direction
+    E2: 9000.0
+    E3: 9000.0
+    nu12: 0.28
+    nu13: 0.28
+    nu23: 0.40
+    G12: 3800.0
+    G13: 3800.0
+    G23: 3200.0
+    Xt: 900.0        # tensile strength, fibre direction
+    Xc: 750.0
+    Yt: 45.0
+    Yc: 140.0
+    S: 55.0          # in-plane shear strength
+  pvc_foam:
+    kind: isotropic
+    E: 75.0          # DIVINYC H45-type foam
+    nu: 0.30
+    shear: 0.80      # shear allowable
+    compression: 1.10  # crushing allowable
+
+stackup:             # bottom -> top
+  - material: glass_epoxy
+    thickness: 1.5
+    fibre_orientation: 0.0
+    role: face
+  - material: pvc_foam
+    thickness: 20.0
+    role: core
+  - material: glass_epoxy
+    thickness: 1.5
+    fibre_orientation: 0.0
+    role: face
+
+mesh:
+  elements_x: 40
+  elements_w: 2
+  elements_per_layer:
+    face: 2
+    core: 6
+  element_order: 2      # quadratic displacement (Q2 on hex8 geometry);
+                        # avoids transverse-shear locking of linear hex8
+
+contact:
+  penalty: 1.0e6        # N/mm^3
+  roller_radius_load: 10.0
+  roller_radius_support: 5.0
+  augmented_lagrangian:
+    enabled: true
+    max_outer: 8
+    tol: 1.0e-3           # max allowed penetration (mm)
+    update_rate: 10.0
+
+loading:
+  max_indentation: 2.0    # mm travel of the load roller
+  n_steps: 10
+
+solver:
+  rtol: 1.0e-8
+  max_newton_iterations: 30

@@ -1,0 +1,77 @@
+# Sweep over core thickness (fast coarse mesh).
+# Run:  sandwich3pb sweep examples/sweep_core_thickness.yaml
+
+name: core_thickness_sweep
+output_dir: results
+
+sweep:
+  output_dir: results/core_thickness_sweep
+  parallel: 1
+
+geometry:
+  length: 300
+  span: 200
+  width: 40
+
+materials:
+  glass_epoxy:
+    kind: orthotropic
+    E1: 39000.0
+    E2: 9000.0
+    E3: 9000.0
+    nu12: 0.28
+    nu13: 0.28
+    nu23: 0.40
+    G12: 3800.0
+    G13: 3800.0
+    G23: 3200.0
+    Xt: 900.0
+    Xc: 750.0
+    Yt: 45.0
+    Yc: 140.0
+    S: 55.0
+  pvc_foam:
+    kind: isotropic
+    E: 75.0
+    nu: 0.30
+    shear: 0.80
+    compression: 1.10
+
+stackup:
+  - material: glass_epoxy
+    thickness: 1.5
+    fibre_orientation: 0.0
+    role: face
+  - material: pvc_foam
+    thickness: [15.0, 20.0, 25.0]     # <-- swept parameter
+    role: core
+  - material: glass_epoxy
+    thickness: 1.5
+    fibre_orientation: 0.0
+    role: face
+
+mesh:
+  elements_x: 40
+  elements_w: 2
+  elements_per_layer:
+    face: 2
+    core: 6
+  element_order: 2      # Q2: no transverse-shear locking
+
+contact:
+  penalty: 1.0e6
+  roller_radius_load: 10.0
+  roller_radius_support: 5.0
+  augmented_lagrangian:
+    enabled: true
+    max_outer: 6
+    tol: 2.0e-3
+    update_rate: 10.0
+
+loading:
+  max_indentation: 1.5
+  n_steps: 6
+
+solver:
+  rtol: 1.0e-8
+  max_newton_iterations: 30
