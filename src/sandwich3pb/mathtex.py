@@ -8,9 +8,10 @@ Quantities are written once as TeX (``$...$``) and rendered three ways:
   renders ``$...$`` natively in any text, table cell or axis label.
 * **HTML** -- a browser has no TeX, and pulling KaTeX/MathJax from a CDN
   would break the report's promise to be self-contained. Instead each
-  snippet is typeset once with matplotlib's mathtext and inlined as an
-  SVG ``<img>``, so the HTML stays a single portable file that displays
-  the same mathematics as the PDF with no network and no JavaScript.
+  snippet is typeset once with matplotlib's mathtext and inlined as a
+  base64 SVG data URI, so the HTML stays a single portable file that
+  displays the same mathematics as the PDF with no network and no
+  JavaScript.
 
 Only the mathtext subset is used (``\\sigma``, ``\\tau``, ``_``/``^``,
 ``\\mathrm``, ``\\frac``, ``\\sqrt``, ``\\max``, ``\\approx``, ``\\cdot``),
@@ -19,6 +20,7 @@ all of which matplotlib supports natively -- no external LaTeX install.
 
 from __future__ import annotations
 
+import base64
 import re
 from functools import lru_cache
 
@@ -83,9 +85,15 @@ def _math_svg(expression: str) -> str:
     svg = _extract_svg(buffer.getvalue().decode("utf-8"))
     if svg is None:
         return f"<code>{_escape(expression)}</code>"
+    # The payload *must* be a data URI: the SVG markup is full of double
+    # quotes (xmlns, width, viewBox), and inlining it raw would end the
+    # src="..." attribute at the first one and leave the rest of the
+    # document as garbage attributes.
+    payload = base64.b64encode(svg.encode("utf-8")).decode("ascii")
     return (
         '<img class="math" alt="' + _escape(expression) + '" '
-        'style="vertical-align:-0.22em" src="' + svg + '">'
+        'style="vertical-align:-0.22em" '
+        'src="data:image/svg+xml;base64,' + payload + '">'
     )
 
 

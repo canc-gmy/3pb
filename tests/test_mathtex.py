@@ -1,5 +1,6 @@
 """Tests for TeX markup and its rendering into the three report formats."""
 
+import base64
 import re
 
 from sandwich3pb.mathtex import render_html, strip_math, tex
@@ -36,8 +37,31 @@ class TestRenderHtml:
         out = render_html("value $\\sigma_{xx}$ end")
         assert "<img" in out and "class=\"math\"" in out
         assert out.startswith("value <img") and out.endswith(" end")
-        # self-contained: the SVG payload is inlined, nothing is fetched
-        assert 'src="<svg' in out
+        # self-contained: the SVG is inlined as a data URI, nothing fetched
+        assert 'src="data:image/svg+xml;base64,' in out
+
+    def test_the_img_tag_is_well_formed(self):
+        """Raw SVG in src="..." ends the attribute at its first inner quote.
+
+        Every attribute value must be quoted and free of stray quotes, or
+        the browser silently drops the image and renders the alt text.
+        """
+        out = render_html(r"$\sigma_{xx}$")
+        tag = out[out.index("<img"):out.index(">") + 1]
+        attrs = dict(re.findall(r'(\w+)="([^"]*)"', tag))
+        assert list(attrs) == ["class", "alt", "style", "src"]
+        payload = attrs["src"].split(",", 1)[1]
+        assert attrs["src"].startswith("data:image/svg+xml;base64,")
+        assert base64.b64decode(payload).lstrip().startswith(b"<svg")
+
+    def test_html_math_images_actually_decode(self):
+        """Every rendered snippet in the report must be a decodable SVG."""
+        html = build_html(FakeResults(make_config(), "."))
+        sources = re.findall(r'class="math"[^>]*src="([^"]*)"', html)
+        assert sources
+        for src in sources:
+            payload = src.split(",", 1)[1]
+            assert base64.b64decode(payload).lstrip().startswith(b"<svg")
 
     def test_prose_amounts_are_not_mistaken_for_math(self):
         """``$5 and $6`` is money, not a math span."""
