@@ -31,6 +31,11 @@ rigidity, max force, max deflection, force gradient and failure indices.
 
 ## Installation
 
+```bash
+git clone https://github.com/canc-gmy/3pb.git
+cd 3pb
+```
+
 FEniCSx must come from conda-forge (no PyPI wheels):
 
 ```bash
@@ -55,7 +60,7 @@ Outputs land in `results/glass_pvc_reference/`:
 | `load_deflection.csv` | step history: travel, force, deflection |
 | `profile_midspan.csv` | σxx, τxz through the thickness at mid-span |
 | `summary.json` | every extracted quantity + the effective config |
-| `plots/*.png` | load–deflection and thickness-profile figures |
+| `plots/*.{svg,pdf,png}` | vector figures: stackup, load–deflection, thickness profile |
 | `fields.xdmf` | displacement + stress fields for ParaView |
 
 ### 2. Python API

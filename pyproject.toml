@@ -35,7 +35,9 @@ dev = ["pytest", "pytest-cov"]
 sandwich3pb = "sandwich3pb.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/example/sandwich3pb"
+Homepage = "https://github.com/canc-gmy/3pb"
+Repository = "https://github.com/canc-gmy/3pb"
+Issues = "https://github.com/canc-gmy/3pb/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
