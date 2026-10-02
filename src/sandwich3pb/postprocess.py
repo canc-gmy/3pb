@@ -177,6 +177,68 @@ def midspan_profile(mesh_data, stress: np.ndarray, counts: np.ndarray,
     return out
 
 
+def beam_axis_profile(stress: np.ndarray, counts: np.ndarray, mesh_data,
+                      cfg: Config) -> Dict[str, object]:
+    """Stress along the beam axis at representative layer stations.
+
+    Three-point bending puts bending stress and shear stress at different
+    places along the span, so a single mid-span section hides half the
+    picture. This samples the same recovered nodal stress along the whole
+    beam at the mid-thickness of the bottom face, the core (if any) and
+    the top face -- which is how the classic pair of diagrams (sigma_xx
+    peaking at mid-span, tau_xz peaking at the supports) is drawn.
+
+    Stations whose nodes are missing are skipped, so the result stays
+    usable for coarse meshes and half models.
+    """
+    bounds = cfg.layer_z_bounds
+    roles = cfg.resolve_roles()
+    core = [i for i, r in enumerate(roles) if r == "core"]
+    picks = [0]
+    if core:
+        picks.append(core[len(core) // 2])
+    picks.append(len(cfg.stackup) - 1)
+
+    out: Dict[str, object] = {
+        "x": None,
+        "x_station": [],
+        "station_layer": [],
+        "station_z": [],
+        "station_label": [],
+        "sigma_xx": [],
+        "tau_xz": [],
+    }
+    tol = 1.0e-6 * max(bounds[-1], 1.0)
+    for layer in picks:
+        z_mid = 0.5 * (bounds[layer] + bounds[layer + 1])
+        nodes = np.where(np.abs(mesh_data.x[:, 2] - z_mid) < tol)[0]
+        nodes = np.array([n for n in nodes if counts[n, layer] > 0], dtype=int)
+        if nodes.size == 0:
+            continue
+        # A station picks up every node on that z-plane, which is one per
+        # element column across the width. Averaging them collapses each
+        # x station to a single value -- otherwise the "line" doubles back
+        # on itself and the CSV carries duplicate x rows.
+        xs = mesh_data.x[nodes, 0]
+        uniq, inverse = np.unique(xs, return_inverse=True)
+        per_station = np.bincount(inverse).astype(float)
+        sxx = np.bincount(
+            inverse, weights=stress[nodes, layer, 0]
+        ) / per_station
+        sxz = np.bincount(
+            inverse, weights=stress[nodes, layer, 4]
+        ) / per_station
+        if out["x"] is None:
+            out["x"] = uniq.copy()
+        out["x_station"].append(uniq)
+        out["station_layer"].append(layer)
+        out["station_z"].append(z_mid)
+        out["station_label"].append(cfg.stackup[layer].material)
+        out["sigma_xx"].append(sxx)
+        out["tau_xz"].append(sxz)
+    return out
+
+
 def failure_indices(cfg: Config, mesh_data, stress: np.ndarray,
                     counts: np.ndarray,
                     quads: Optional[List] = None) -> Dict[str, Dict]:

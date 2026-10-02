@@ -1,48 +1,52 @@
 # Glass/epoxy faceskins over PVC foam core — three-point bending
-# Units: mm, N, MPa
+# Units: SI (m, N, Pa) — see `units:` below. sandwich3pb converts these to
+# its internal mm/N/MPa system at load time; reports and figures are
+# written back in the units declared here.
+
+units: si
 
 name: glass_pvc_reference
 output_dir: results
 
 geometry:
-  length: 300        # overall beam length
-  span: 200          # distance between support rollers
-  width: 40          # beam width
+  length: 0.300        # overall beam length (m)
+  span: 0.200          # distance between support rollers (m)
+  width: 0.040         # beam width (m)
 
 materials:
   glass_epoxy:
     kind: orthotropic
-    E1: 39000.0      # fibre direction
-    E2: 9000.0
-    E3: 9000.0
+    E1: 3.9e10         # fibre direction (Pa)
+    E2: 9.0e9
+    E3: 9.0e9
     nu12: 0.28
     nu13: 0.28
     nu23: 0.40
-    G12: 3800.0
-    G13: 3800.0
-    G23: 3200.0
-    Xt: 900.0        # tensile strength, fibre direction
-    Xc: 750.0
-    Yt: 45.0
-    Yc: 140.0
-    S: 55.0          # in-plane shear strength
+    G12: 3.8e9
+    G13: 3.8e9
+    G23: 3.2e9
+    Xt: 9.0e8          # tensile strength, fibre direction (Pa)
+    Xc: 7.5e8
+    Yt: 4.5e7
+    Yc: 1.4e8
+    S: 5.5e7           # in-plane shear strength (Pa)
   pvc_foam:
     kind: isotropic
-    E: 75.0          # DIVINYC H45-type foam
+    E: 7.5e7           # DIVINYC H45-type foam (Pa)
     nu: 0.30
-    shear: 0.80      # shear allowable
-    compression: 1.10  # crushing allowable
+    shear: 8.0e5       # shear allowable (Pa)
+    compression: 1.1e6  # core crushing allowable (Pa)
 
 stackup:             # bottom -> top
   - material: glass_epoxy
-    thickness: 1.5
+    thickness: 1.5e-3
     fibre_orientation: 0.0
     role: face
   - material: pvc_foam
-    thickness: 20.0
+    thickness: 20.0e-3
     role: core
   - material: glass_epoxy
-    thickness: 1.5
+    thickness: 1.5e-3
     fibre_orientation: 0.0
     role: face
 
@@ -56,17 +60,17 @@ mesh:
                         # avoids transverse-shear locking of linear hex8
 
 contact:
-  penalty: 1.0e6        # N/mm^3
-  roller_radius_load: 10.0
-  roller_radius_support: 5.0
+  penalty: 1.0e15        # N/m^3
+  roller_radius_load: 10.0e-3
+  roller_radius_support: 5.0e-3
   augmented_lagrangian:
     enabled: true
     max_outer: 8
-    tol: 1.0e-3           # max allowed penetration (mm)
+    tol: 1.0e-6           # max allowed penetration (m)
     update_rate: 10.0
 
 loading:
-  max_indentation: 2.0    # mm travel of the load roller
+  max_indentation: 2.0e-3   # m of travel of the load roller
   n_steps: 10
 
 solver:

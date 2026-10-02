@@ -3,6 +3,11 @@
 The Markdown file is canonical; the HTML file embeds the same content with
 base64 images (self-contained, no external assets); the PDF is assembled
 with matplotlib PdfPages (also dependency-free).
+
+Every quantity is written once, as TeX, in the unit system the case file
+declared -- so an SI case reports stresses in Pa and lengths in m, a
+``mm_n_mpa`` case in MPa and mm, and all three outputs show the same
+numbers. See :mod:`sandwich3pb.mathtex` for how the markup is rendered.
 """
 
 from __future__ import annotations
@@ -18,10 +23,26 @@ from .config import Config
 from .figures import (
     fig_laminate_stackup,
     fig_load_deflection,
+    fig_stress_along_span,
     fig_thickness_profile,
     save_all_figures,
 )
+from .mathtex import render_html, tex
 from .materials import localized_quad_form
+from .units import (
+    FORCE,
+    GRADIENT,
+    LENGTH,
+    NONE,
+    PENALTY,
+    RIGIDITY,
+    STRESS,
+    DEFAULT_SYSTEM,
+    UnitSystem,
+    fmt_tex_list,
+    fmt_tex_num,
+    fmt_tex_qty,
+)
 
 
 # --------------------------------------------------------------------------
@@ -30,6 +51,11 @@ from .materials import localized_quad_form
 
 
 def _fmt(v: Any, digits: int = 4) -> str:
+    """Plain-text number, for the few places TeX would be wrong.
+
+    Report *tables* go through :func:`fmt_tex_qty`; this stays for the
+    console summary and for plain strings that pass through untouched.
+    """
     if v is None:
         return "—"
     if isinstance(v, str):
@@ -45,6 +71,18 @@ def _fmt(v: Any, digits: int = 4) -> str:
     return f"{f:.{digits}g}"
 
 
+def _units_of(cfg_or_units) -> UnitSystem:
+    """Accept a :class:`Config` or a :class:`UnitSystem` interchangeably."""
+    if isinstance(cfg_or_units, UnitSystem):
+        return cfg_or_units
+    return cfg_or_units.unit_system
+
+
+def _u(dim: str, units: UnitSystem) -> str:
+    """A parenthesised, TeX-unit column header, e.g. ``($\\mathrm{m}$)``."""
+    return f"({tex(units.tex_symbol(dim))})"
+
+
 def _axial_moduli(cfg: Config) -> List[float]:
     """Uniaxial modulus along the beam axis for each stackup layer (MPa)."""
     out = []
@@ -57,9 +95,12 @@ def _axial_moduli(cfg: Config) -> List[float]:
 
 
 def _layup_rows(cfg: Config) -> Tuple[List[str], List[List[str]]]:
+    units = cfg.unit_system
     header = [
-        "#", "role", "material", "thickness (mm)",
-        "fibre orientation (°)", "E_x (MPa)",
+        "#", "role", "material",
+        f"thickness {_u(LENGTH, units)}",
+        f"fibre orientation {tex(chr(92) + 'theta')} (deg)",
+        f"$E_x$ {_u(STRESS, units)}",
     ]
     roles = cfg.resolve_roles()
     E_x = _axial_moduli(cfg)
@@ -70,84 +111,100 @@ def _layup_rows(cfg: Config) -> Tuple[List[str], List[List[str]]]:
                 str(i + 1),
                 roles[i],
                 layer.material,
-                _fmt(layer.thickness, 4),
-                _fmt(layer.fibre_orientation, 4),
-                _fmt(E_x[i], 4),
+                fmt_tex_qty(layer.thickness, units, LENGTH),
+                fmt_tex_num(layer.fibre_orientation, 4),
+                fmt_tex_qty(E_x[i], units, STRESS),
             ]
         )
     return header, rows
 
 
 def _model_rows(cfg: Config, summary: Dict[str, Any]) -> List[List[str]]:
+    u = cfg.unit_system
     g = cfg.geometry
     c = cfg.contact
-    m = cfg.mesh
     return [
-        ["beam length L", f"{_fmt(g.length)} mm"],
-        ["span (support distance) L_s", f"{_fmt(g.span)} mm"],
-        ["width b", f"{_fmt(g.width)} mm"],
-        ["total thickness t", f"{_fmt(cfg.total_thickness)} mm"],
-        ["load roller radius", f"{_fmt(c.roller_radius_load)} mm"],
-        ["support roller radius", f"{_fmt(c.roller_radius_support)} mm"],
-        ["max indentation", f"{_fmt(cfg.loading.max_indentation)} mm"],
-        ["load steps", str(cfg.loading.n_steps)],
-        ["half model (symmetry)", _fmt(cfg.half_model)],
+        ["beam length " + tex("L"), fmt_tex_qty(g.length, u, LENGTH)],
+        ["span (support distance) " + tex(r"L_s"),
+         fmt_tex_qty(g.span, u, LENGTH)],
+        ["width " + tex("b"), fmt_tex_qty(g.width, u, LENGTH)],
+        ["total thickness " + tex("t"),
+         fmt_tex_qty(cfg.total_thickness, u, LENGTH)],
+        ["load roller radius",
+         fmt_tex_qty(c.roller_radius_load, u, LENGTH)],
+        ["support roller radius",
+         fmt_tex_qty(c.roller_radius_support, u, LENGTH)],
+        ["max indentation",
+         fmt_tex_qty(cfg.loading.max_indentation, u, LENGTH)],
+        ["load steps", tex(str(cfg.loading.n_steps))],
+        ["half model (symmetry)", fmt_tex_num(cfg.half_model)],
         ["nodes / dofs", f"{summary.get('n_nodes', '—')} / "
                          f"{summary.get('n_dofs', '—')}"],
-        ["contact penalty", _fmt(c.penalty, 3)],
+        ["contact penalty " + tex(r"K_p"),
+         fmt_tex_qty(c.penalty, u, PENALTY, 3)],
     ]
 
 
-def _global_rows(summary: Dict[str, Any]) -> List[List[str]]:
-    def g(key: str, digits: int = 4) -> str:
-        return _fmt(summary.get(key), digits)
+def _global_rows(summary: Dict[str, Any],
+                 units: Optional[UnitSystem] = None) -> List[List[str]]:
+    u = units or DEFAULT_SYSTEM
+
+    def q(key: str, dim: str, digits: int = 4) -> str:
+        return fmt_tex_qty(summary.get(key), u, dim, digits)
+
+    def n(key: str, digits: int = 4) -> str:
+        return fmt_tex_num(summary.get(key), digits)
 
     return [
-        ["max force P_max", f"{g('max_force_N')} N"],
-        ["deflection at max force",
-         f"{g('deflection_at_max_force_mm')} mm"],
-        ["max deflection w_max", f"{g('max_deflection_mm')} mm"],
-        ["final roller travel", f"{g('final_travel_mm')} mm"],
-        ["force gradient dP/dw", f"{g('force_gradient_N_per_mm')} N/mm"],
-        ["gradient fit R²", g("gradient_fit_r2", 3)],
-        ["apparent flexural rigidity D (FE)",
-         f"{g('apparent_flexural_rigidity_Nmm2')} N·mm²"],
-        ["layup flexural rigidity EI (analytic)",
-         f"{g('layup_flexural_rigidity_Nmm2')} N·mm²"],
-        ["ratio D_FE / EI_layup", g("rigidity_ratio_FE_over_layup", 4)],
-        ["neutral axis z", f"{g('neutral_axis_z_mm')} mm"],
-        ["load-roller force (final)",
-         f"{g('load_roller_force_N')} N"],
+        ["max force " + tex(r"P_{\max}"), q("max_force_N", FORCE)],
+        ["deflection at max force " + tex("w"),
+         q("deflection_at_max_force_mm", LENGTH)],
+        ["max deflection " + tex(r"w_{\max}"),
+         q("max_deflection_mm", LENGTH)],
+        ["final roller travel", q("final_travel_mm", LENGTH)],
+        ["force gradient " + tex(r"\frac{dP}{dw}"),
+         q("force_gradient_N_per_mm", GRADIENT)],
+        ["gradient fit " + tex("R^2"), n("gradient_fit_r2", 3)],
+        ["apparent flexural rigidity " + tex(r"D") + " (FE)",
+         q("apparent_flexural_rigidity_Nmm2", RIGIDITY)],
+        ["layup flexural rigidity " + tex(r"EI") + " (analytic)",
+         q("layup_flexural_rigidity_Nmm2", RIGIDITY)],
+        ["ratio " + tex(r"D_{\mathrm{FE}}/EI_{\mathrm{layup}}"),
+         n("rigidity_ratio_FE_over_layup", 4)],
+        ["neutral axis " + tex(r"z_0"), q("neutral_axis_z_mm", LENGTH)],
+        ["load-roller force (final)", q("load_roller_force_N", FORCE)],
         ["support reactions (final)",
-         str([_fmt(f) for f in (summary.get("support_reactions_N") or [])])],
-        ["force-balance residual", g("force_balance_residual", 3)],
+         fmt_tex_list(summary.get("support_reactions_N"), u, FORCE)],
+        ["force-balance residual", n("force_balance_residual", 3)],
         ["max contact penetration",
-         f"{g('max_contact_penetration_mm', 3)} mm"],
-        ["all steps converged", _fmt(summary.get("all_steps_converged"))],
+         q("max_contact_penetration_mm", LENGTH, 3)],
+        ["all steps converged", fmt_tex_num(summary.get("all_steps_converged"))],
     ]
 
 
 def _failure_rows(summary: Dict[str, Any]) -> Tuple[List[str], List[List[str]]]:
     header = ["layer", "role", "material", "criterion", "max value", "limit"]
+    limit = tex("1.0")
     rows: List[List[str]] = []
     by_layer = summary.get("failure_by_layer", {}) or {}
     for key, d in sorted(by_layer.items(), key=lambda kv: int(kv[0].split("_")[1])):
         if d["role"] == "face":
             rows.append([
                 key, "face", d.get("material", "—"),
-                "Tsai-Wu index", _fmt(d.get("max_tsai_wu"), 4),
-                "1.0",
+                "Tsai-Wu index " + tex(r"\mathrm{TW}"),
+                fmt_tex_num(d.get("max_tsai_wu"), 4),
+                limit,
             ])
         else:
             rows.append([
                 key, "core", d.get("material", "—"),
-                "shear utilization |τ_xz|/τ_c",
-                _fmt(d.get("max_shear_ratio"), 4), "1.0",
+                "shear utilisation " + tex(r"\frac{|\tau_{xz}|}{\tau_c}"),
+                fmt_tex_num(d.get("max_shear_ratio"), 4), limit,
             ])
             rows.append([
                 key, "core", d.get("material", "—"),
-                "crushing utilization σ_zz/σ_c",
-                _fmt(d.get("max_crushing_ratio"), 4), "1.0",
+                "crushing utilisation " + tex(r"\frac{\sigma_{zz}}{\sigma_c}"),
+                fmt_tex_num(d.get("max_crushing_ratio"), 4), limit,
             ])
     return header, rows
 
@@ -168,6 +225,7 @@ def _md_table(header: List[str], rows: List[List[str]]) -> str:
 def build_markdown(results) -> str:
     cfg = results.cfg
     s = results.summary
+    u = cfg.unit_system
     layup_header, layup_rows = _layup_rows(cfg)
 
     lines = [
@@ -175,6 +233,10 @@ def build_markdown(results) -> str:
         "",
         f"Generated {datetime.datetime.now().isoformat(timespec='seconds')} "
         "with sandwich3pb (FEniCSx/DOLFINx).",
+        "",
+        f"All quantities are given in the case file's own units "
+        f"(`units: {u.name}` — length {u.length}, stress {u.stress}, "
+        f"force {u.force}).",
         "",
         "## Layup / stackup",
         "",
@@ -186,11 +248,11 @@ def build_markdown(results) -> str:
         "",
         "## Global results",
         "",
-        _md_table(["quantity", "value"], _global_rows(s)),
+        _md_table(["quantity", "value"], _global_rows(s, u)),
         "",
         "## Failure indices",
         "",
-        "Values above 1.0 predict failure by the respective criterion.",
+        "Values above $1.0$ predict failure by the respective criterion.",
         "",
     ]
     f_header, f_rows = _failure_rows(s)
@@ -215,11 +277,25 @@ def build_markdown(results) -> str:
         "",
         "![profile](plots/thickness_profile.svg)",
         "",
+        "Each layer is drawn at true thickness and shaded by the stress it "
+        "carries — red in compression ($/sigma_{xx}<0$ in the plotted "
+        "sign convention), blue in tension. The dashed line is a "
+        "least-squares fit of the samples within each layer; open circles "
+        "are the raw recovery points.",
+        "",
+        "## Stress along the span",
+        "",
+        "![span](plots/stress_along_span.svg)",
+        "",
+        "$/sigma_{xx}$ is sampled at the mid-thickness of each layer and "
+        "peaks under the load roller; $/tau_{xz}$ peaks at the supports "
+        "where the shear transfer happens.",
+        "",
         "## Convergence",
         "",
         f"{s.get('n_steps', '—')} load steps, "
-        f"assembly {s.get('assembly_time_s', float('nan')):.1f} s, "
-        f"solve {s.get('solve_time_s', float('nan')):.1f} s.",
+        f"assembly {_fmt(s.get('assembly_time_s'), 3)} s, "
+        f"solve {_fmt(s.get('solve_time_s'), 3)} s.",
         "",
     ]
     return "\n".join(lines)
@@ -245,6 +321,7 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   th {{ background: #eef3f7; }}
   tr:nth-child(even) td {{ background: #fafbfc; }}
   img {{ max-width: 100%; border: 1px solid #ddd; margin: .5em 0; }}
+  img.math {{ border: 0; margin: 0; max-width: none; }}
   .meta {{ color: #666; font-size: .9em; }}
   .ok {{ color: #1a7f37; font-weight: 600; }}
   .bad {{ color: #b42318; font-weight: 600; }}
@@ -260,13 +337,19 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 def build_html(results) -> str:
     cfg = results.cfg
     s = results.summary
+    u = cfg.unit_system
     layup_header, layup_rows = _layup_rows(cfg)
     f_header, f_rows = _failure_rows(s)
 
+    def cell(value: Any) -> str:
+        """Typeset any ``$...$`` in a cell before it reaches the browser."""
+        return render_html(str(value))
+
     def table(header, rows):
-        head = "".join(f"<th>{h}</th>" for h in header)
+        head = "".join(f"<th>{cell(h)}</th>" for h in header)
         body = "".join(
-            "<tr>" + "".join(f"<td>{c}</td>" for c in r) + "</tr>" for r in rows
+            "<tr>" + "".join(f"<td>{cell(c)}</td>" for c in r) + "</tr>"
+            for r in rows
         )
         return f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
 
@@ -299,6 +382,11 @@ def build_html(results) -> str:
             f'<p class="meta">Generated '
             f"{datetime.datetime.now().isoformat(timespec='seconds')} with "
             "sandwich3pb (FEniCSx/DOLFINx)</p>",
+            cell(
+                "<p>All quantities are in the case file's own units "
+                f"({u.name}): length {u.length}, stress {u.stress}, "
+                f"force {u.force}.</p>"
+            ),
             "<h2>Laminate cross-section (true thickness)</h2>",
             img(os.path.join(plots_dir, "laminate_stackup.svg")),
             "<h2>Layup / stackup</h2>",
@@ -306,14 +394,29 @@ def build_html(results) -> str:
             "<h2>Model</h2>",
             table(["quantity", "value"], _model_rows(cfg, s)),
             "<h2>Global results</h2>",
-            table(["quantity", "value"], _global_rows(s)),
+            table(["quantity", "value"], _global_rows(s, u)),
             "<h2>Failure indices</h2>",
-            "<p>Values above 1.0 predict failure by the respective criterion.</p>",
+            "<p>Values above 1.0 predict failure by the respective "
+            "criterion.</p>",
             table(f_header, f_rows) if f_rows else "<p><em>no data</em></p>",
             "<h2>Load–deflection</h2>",
             img(os.path.join(plots_dir, "load_deflection.svg")),
             "<h2>Mid-span through-thickness profile</h2>",
             img(os.path.join(plots_dir, "thickness_profile.svg")),
+            cell(
+                "<p>Each layer is drawn at true thickness and shaded by the "
+                "stress it carries — red in compression "
+                r"($\sigma_{xx} \leq 0$), blue in tension. The dashed line is "
+                "a least-squares fit of the samples within each layer; open "
+                "circles are the raw recovery points.</p>"
+            ),
+            "<h2>Stress along the span</h2>",
+            img(os.path.join(plots_dir, "stress_along_span.svg")),
+            cell(
+                "<p>$\\sigma_{xx}$ is sampled at the mid-thickness of each "
+                "layer and peaks under the load roller; $\\tau_{xz}$ peaks "
+                "at the supports where the shear transfer happens.</p>"
+            ),
             f"<h2>Convergence</h2><p>{conv_html} — "
             f"{s.get('n_steps', '—')} load steps, assembly "
             f"{_fmt(s.get('assembly_time_s'), 3)} s, solve "
@@ -387,30 +490,56 @@ def build_pdf(results, pdf_path: str) -> str:
 
         # ---- page 2: global results + failure indices -------------------
         fig = plt.figure(figsize=(8.27, 11.69), dpi=110)
-        global_rows = _global_rows(s)
+        fig.text(0.08, 0.952,
+                 f"Three-Point Bending — {cfg.name}",
+                 fontsize=12, weight="bold", color="#2c5f8a")
+        fig.text(0.92, 0.952, f"units: {cfg.units}", fontsize=9,
+                 color="#555555", ha="right")
+        global_rows = _global_rows(s, cfg.unit_system)
         _draw_table(fig, ["quantity", "value"], global_rows,
-                    title="Global results", top=0.93)
+                    title="Global results", top=0.90)
 
         f_header, f_rows = _failure_rows(s)
         if f_rows:
             _draw_table(fig, f_header, f_rows,
-                        title="Failure indices (limit = 1.0)", top=0.42)
+                        title="Failure indices (limit = 1.0)", top=0.40)
 
         pdf.savefig(fig)
         plt.close(fig)
 
         # ---- page 3: load-deflection + thickness profile (vector) -------
         fig = plt.figure(figsize=(8.27, 11.69), dpi=110)
-        ld_ax = fig.add_axes([0.22, 0.52, 0.6, 0.36])
+        fig.text(0.08, 0.952,
+                 f"Three-Point Bending — {cfg.name}",
+                 fontsize=12, weight="bold", color="#2c5f8a")
+        fig.text(0.92, 0.952, f"units: {cfg.units}", fontsize=9,
+                 color="#555555", ha="right")
+        ld_ax = fig.add_axes([0.22, 0.56, 0.6, 0.32])
         fig_load_deflection(results, ax=ld_ax)
+        fig.text(0.08, 0.505, "Through-thickness stress profile (mid-span)",
+                 fontsize=11, weight="bold", color="#2c5f8a")
 
         if getattr(results, "profile", None):
-            prof_ax1 = fig.add_axes([0.13, 0.12, 0.32, 0.28])
-            prof_ax2 = fig.add_axes([0.57, 0.12, 0.32, 0.28])
+            prof_ax1 = fig.add_axes([0.12, 0.14, 0.30, 0.28])
+            prof_ax2 = fig.add_axes([0.58, 0.14, 0.30, 0.28])
             fig_thickness_profile(results, axs=(prof_ax1, prof_ax2))
 
         pdf.savefig(fig)
         plt.close(fig)
+
+        # ---- page 4: stress along the span ------------------------------
+        if getattr(results, "span_profile", None):
+            fig = plt.figure(figsize=(8.27, 11.69), dpi=110)
+            fig.text(0.08, 0.952,
+                     f"Three-Point Bending — {cfg.name}",
+                     fontsize=12, weight="bold", color="#2c5f8a")
+            fig.text(0.92, 0.952, f"units: {cfg.units}", fontsize=9,
+                     color="#555555", ha="right")
+            ax1 = fig.add_axes([0.13, 0.60, 0.74, 0.28])
+            ax2 = fig.add_axes([0.13, 0.16, 0.74, 0.28])
+            fig_stress_along_span(results, axs=(ax1, ax2))
+            pdf.savefig(fig)
+            plt.close(fig)
 
     return pdf_path
 
@@ -425,6 +554,8 @@ def _draw_table(fig, header: List[str], rows: List[List[str]], title: str,
     ax.axis("off")
     fig.text(0.08, top + 0.012, title, fontsize=12, weight="bold",
              color="#2c5f8a")
+    # mathtext typesets the ``$...$`` the table builders emit, so the PDF
+    # shows the same symbols as the Markdown and HTML reports
     cell_text = [[str(c) for c in r] for r in rows]
     tab = ax.table(
         cellText=cell_text,

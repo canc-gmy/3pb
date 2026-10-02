@@ -65,25 +65,86 @@ class FakeResults:
 def test_layup_rows_include_orientation(tmp_path):
     cfg = make_config()
     header, rows = _layup_rows(cfg)
-    assert "fibre orientation (°)" in header
-    assert rows[1][4] == "0"  # core has no orientation value of interest
+    assert any("fibre orientation" in h for h in header)
+    assert rows[1][4] == "$0$"  # core has no orientation value of interest
     assert rows[0][2] == "glass_epoxy"
+
+
+def test_layup_units_follow_the_case_file():
+    """A header must announce the case file's units, not the internal ones."""
+    from sandwich3pb.units import MM_N_MPA, SI
+
+    cfg = make_config()
+    si_header, _ = _layup_rows(cfg)
+    assert any(r"\mathrm{m}" in h for h in si_header)   # SI default
+    assert any(r"\mathrm{Pa}" in h for h in si_header)
+    assert not any(r"\mathrm{mm}" in h for h in si_header)
+
+    cfg.units = MM_N_MPA.name
+    mm_header, _ = _layup_rows(cfg)
+    assert any(r"\mathrm{mm}" in h for h in mm_header)
+    assert any(r"\mathrm{MPa}" in h for h in mm_header)
 
 
 def test_layup_rows_show_90deg(tmp_path):
     cfg = make_config()
     cfg.stackup[0].fibre_orientation = 90.0
     _, rows = _layup_rows(cfg)
-    assert rows[0][4] == "90"
+    assert rows[0][4] == "$90$"
 
 
 def test_global_rows_contain_rigidity():
     cfg = make_config()
     view = FakeResults(cfg, ".")
-    rows = _global_rows(view.summary)
+    rows = _global_rows(view.summary, cfg.unit_system)
     flat = " | ".join(cell for r in rows for cell in r)
     assert "flexural rigidity" in flat
     assert "force gradient" in flat
+
+
+def test_global_rows_convert_to_case_units():
+    """Internal mm/N/MPa values must be presented in the case file's units."""
+    from sandwich3pb.units import MM_N_MPA
+
+    cfg = make_config()
+    view = FakeResults(cfg, ".")
+
+    si = _global_rows(view.summary, cfg.unit_system)
+    flat_si = " | ".join(c for r in si for c in r)
+    # 1200.5 N is 1.2005 kN-scale: N is the unit in both systems
+    assert r"$1200\,\mathrm{N}$" in flat_si
+    # 2.5e8 N*mm^2 -> 250 N*m^2
+    assert r"250" in flat_si and r"\mathrm{N\,m^{2}}" in flat_si
+    # 0.8 mm -> 8e-4 m (below the readability threshold, so scientific)
+    assert r"$8\times 10^{-4}\,\mathrm{m}$" in flat_si
+
+    cfg.units = MM_N_MPA.name
+    mm = _global_rows(view.summary, cfg.unit_system)
+    flat_mm = " | ".join(c for r in mm for c in r)
+    assert r"$0.8\,\mathrm{mm}$" in flat_mm
+    assert r"\mathrm{N\,mm^{2}}" in flat_mm
+    assert r"\mathrm{m}$" not in flat_mm
+
+
+def test_global_rows_use_tex_for_scientific_stress():
+    """Large SI magnitudes become ``\\times 10^{n}``, never ``e+07``."""
+    from sandwich3pb.units import SI
+
+    view = FakeResults(make_config(), ".")
+    view.summary["load_roller_force_N"] = 6.7e7
+    rows = _global_rows(view.summary, SI)
+    flat = " | ".join(c for r in rows for c in r)
+    assert r"$6.7\times 10^{7}\,\mathrm{N}$" in flat
+    assert "e+07" not in flat
+
+
+def test_markdown_declares_units_and_math():
+    cfg = make_config()
+    view = FakeResults(cfg, ".")
+    md = build_markdown(view)
+    assert "units: si" in md
+    assert r"\mathrm{Pa}" in md
+    assert "$P_{\\max}$" in md
 
 
 def test_failure_rows_cover_all_layers():

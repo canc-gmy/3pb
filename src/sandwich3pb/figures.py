@@ -13,14 +13,19 @@ readability and annotated as such.
 
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, List
 
 import numpy as np
 
 from .config import Config
 from .postprocess import layup_flexural_rigidity
+from .units import FORCE, GRADIENT, LENGTH, STRESS
 
 _DPI_PNG = 200
+
+#: Diverging map for stress: red = positive (tension / one sense of shear
+#: flow), blue = negative (compression / the opposite sense).
+_STRESS_CMAP = "RdBu_r"
 
 
 # --------------------------------------------------------------------------
@@ -37,11 +42,138 @@ def _material_colors(cfg: Config) -> Dict[str, str]:
     return {name: cmap(i % 10) for i, name in enumerate(names)}
 
 
+def _layer_colors(cfg: Config) -> Dict[int, str]:
+    """Colour per stackup layer, not per material.
+
+    A symmetric layup uses the same material twice, so repeated
+    materials are progressively lightened towards white to keep the two
+    facesheets distinguishable in legends and curves.
+    """
+    import matplotlib.colors as mcolors
+
+    base = _material_colors(cfg)
+    seen: Dict[str, int] = {}
+    out: Dict[int, str] = {}
+    for i, layer in enumerate(cfg.stackup):
+        n = seen.get(layer.material, 0)
+        seen[layer.material] = n + 1
+        rgb = np.asarray(mcolors.to_rgb(base[layer.material]), dtype=float)
+        factor = 1.0 - 0.40 * n
+        out[i] = mcolors.to_hex(rgb * factor + (1.0 - factor))
+    return out
+
+
 def _apply_style(fig) -> None:
     for ax in fig.axes:
         ax.grid(alpha=0.25, linewidth=0.5)
         for spine in ax.spines.values():
             spine.set_linewidth(0.6)
+
+
+def _display(cfg: Config, dim: str, values):
+    """Internal-unit values (mm, MPa) -> the case file's display units."""
+    return cfg.unit_system.from_internal(dim, np.asarray(values, dtype=float))
+
+
+def _unit_suffix(cfg: Config, dim: str) -> str:
+    sym = cfg.unit_system.symbol(dim)
+    return f" ({sym})" if sym else ""
+
+
+def _layer_bands(ax, cfg: Config, colors: Dict[str, str]) -> list:
+    """Shade every stackup layer so the stress reads inside its own layer.
+
+    Returns the layer interface positions in display units, for reuse by
+    the neutral-axis line and the layer labels.
+    """
+    import matplotlib.transforms as mtransforms
+
+    bounds = list(_display(cfg, LENGTH, cfg.layer_z_bounds))
+    roles = cfg.resolve_roles()
+    for i, layer in enumerate(cfg.stackup):
+        ax.axhspan(bounds[i], bounds[i + 1],
+                   color=colors[layer.material],
+                   alpha=0.12 if roles[i] == "core" else 0.07,
+                   zorder=0)
+    for b in bounds:
+        ax.axhline(b, color="0.55", linewidth=0.6, linestyle=(0, (4, 3)),
+                   zorder=1)
+    return bounds
+
+
+def _layer_labels(ax, cfg: Config, bounds: list, colors: Dict[str, str],
+                  colors_stress=None) -> None:
+    """Name each band in a reserved right margin (blended transform)."""
+    import matplotlib.transforms as mtransforms
+
+    trans = mtransforms.blended_transform_factory(ax.transAxes, ax.transData)
+    for i, layer in enumerate(cfg.stackup):
+        thickness = bounds[i + 1] - bounds[i]
+        ax.text(
+            1.03, 0.5 * (bounds[i] + bounds[i + 1]),
+            f"{layer.material}\nt = {thickness:.3g}",
+            transform=trans, va="center", ha="left", fontsize=7,
+            color=colors[layer.material],
+        )
+
+
+def _layer_trend(z, vals, layer, n_layers):
+    """Stress trend within each layer, stitched in z order.
+
+    A stiff layer only two elements thick is sampled at three stations,
+    which on its own reads as a violent zig-zag even though the field is
+    a clean linear ramp: refining the facesheet to six elements puts
+    samples at exactly the same three values with the intermediate ones
+    falling on the same straight line. The figure therefore draws the
+    least-squares line fitted through each layer's samples -- the trend
+    the field converges to -- and keeps every recovered sample visible as
+    a point so nothing is hidden. The vertical step at an interface is
+    real: stress jumps there, strain does not.
+    """
+    zz: List[np.ndarray] = []
+    vv: List[np.ndarray] = []
+    for l in range(n_layers):
+        m = layer == l
+        if not m.any():
+            continue
+        if m.sum() >= 2:
+            slope, intercept = np.polyfit(z[m], vals[m], 1)
+            vv.append(slope * z[m] + intercept)
+        else:
+            vv.append(vals[m].copy())
+        zz.append(z[m])
+    if not zz:
+        return z, vals
+    zf = np.concatenate(zz)
+    vf = np.concatenate(vv)
+    order = np.argsort(zf, kind="stable")
+    return zf[order], vf[order]
+
+
+def _fill_stress_area(ax, z, vals, norm, cmap) -> None:
+    """Fill between the stress curve and the zero axis, colour by sign.
+
+    One polygon per segment coloured by the segment's mean value, which
+    gives a true gradient instead of a flat per-layer block and keeps the
+    sign change at the neutral axis sharp.
+    """
+    from matplotlib.patches import Polygon
+
+    if z.size < 2:
+        return
+    for i in range(z.size - 1):
+        seg = 0.5 * (vals[i] + vals[i + 1])
+        ax.add_patch(
+            Polygon(
+                [(vals[i], z[i]), (vals[i + 1], z[i + 1]),
+                 (0.0, z[i + 1]), (0.0, z[i])],
+                closed=True,
+                facecolor=cmap(norm(seg)),
+                edgecolor="none",
+                alpha=0.9,
+                zorder=2,
+            )
+        )
 
 
 # --------------------------------------------------------------------------
@@ -114,7 +246,9 @@ def fig_laminate_stackup(cfg: Config, aspect: float = 5.0, ax=None):
     ax.add_patch(FancyArrowPatch(
         (-half_span, y_dim), (half_span, y_dim),
         arrowstyle="<->", mutation_scale=9, color="0.3", linewidth=0.8))
-    ax.annotate(f"span {cfg.geometry.span:g} mm", xy=(0, y_dim),
+    ax.annotate(f"span {cfg.unit_system.from_internal(LENGTH, cfg.geometry.span):g}"
+                f"{_unit_suffix(cfg, LENGTH)}",
+                xy=(0, y_dim),
                 xytext=(0, y_dim - 0.55 * r_sup * A),
                 ha="center", va="top", fontsize=8)
     ax.annotate("load roller", xy=(0, (t + r_load) * A),
@@ -129,13 +263,16 @@ def fig_laminate_stackup(cfg: Config, aspect: float = 5.0, ax=None):
     ax.set_ylim(-3.9 * r_sup * A, (t + 3.0 * r_load) * A)
     ax.set_aspect("equal", adjustable="box")
 
-    # y ticks in TRUE mm (labels show real z at the pre-scaled positions)
+    # y ticks on the pre-scaled positions, labelled in the case's units
     ticks = [v for v in (0, 5, 10, 15, 20, 25, 30) if v <= t]
     ax.set_yticks([v * A for v in ticks])
-    ax.set_yticklabels([str(v) for v in ticks])
-    ax.set_ylabel("z (mm, true scale)", fontsize=8)
-    ax.set_xlabel("beam axis x (mm)  —  compressed for readability",
+    ax.set_yticklabels(
+        [f"{cfg.unit_system.from_internal(LENGTH, v):g}" for v in ticks]
+    )
+    ax.set_ylabel("z" + _unit_suffix(cfg, LENGTH) + "  (true scale)",
                   fontsize=8)
+    ax.set_xlabel("beam axis x" + _unit_suffix(cfg, LENGTH)
+                  + "  —  compressed for readability", fontsize=8)
     ax.tick_params(labelsize=7.5)
 
     # ---- layer labels in the reserved right margin --------------------------
@@ -147,14 +284,19 @@ def fig_laminate_stackup(cfg: Config, aspect: float = 5.0, ax=None):
         rot = f", {theta:g}°" if face else ""
         ax.text(
             1.02, (z0 + layer.thickness / 2.0) * A,
-            f"{layer.material}\n  t = {layer.thickness:g} mm{rot}",
+            f"{layer.material}\n  t = "
+            f"{cfg.unit_system.from_internal(LENGTH, layer.thickness):g}"
+            f"{_unit_suffix(cfg, LENGTH)}{rot}",
             transform=trans, va="center", ha="left", fontsize=7.5,
             color=colors[layer.material],
         )
         z0 += layer.thickness
     # neutral-axis label inside the axes (left end of the dashed line) so
     # it cannot collide with the layer labels in the right margin
-    ax.text(0.02, na * A + 8, f"neutral axis  z = {na:.2f} mm",
+    ax.text(0.02, na * A + 8,
+            f"neutral axis  z = "
+            f"{cfg.unit_system.from_internal(LENGTH, na):.3g}"
+            f"{_unit_suffix(cfg, LENGTH)}",
             transform=trans, va="bottom", ha="left", fontsize=7.5,
             color="crimson")
 
@@ -175,8 +317,11 @@ def fig_load_deflection(results, ax=None):
     import matplotlib.pyplot as plt
 
     force = np.array([r["force_N"] for r in getattr(results, "history", [])])
-    deflection = np.array(
-        [r["deflection_mm"] for r in getattr(results, "history", [])]
+    cfg = results.cfg
+    deflection = cfg.unit_system.from_internal(
+        LENGTH,
+        np.array([r["deflection_mm"] for r in getattr(results, "history", [])],
+                 dtype=float),
     )
     grad = results.summary.get("force_gradient_N_per_mm", float("nan"))
 
@@ -188,11 +333,16 @@ def fig_load_deflection(results, ax=None):
     if deflection.size:
         ax.plot(deflection, force, "o-", ms=4, lw=1.4, label="FE")
     if np.isfinite(grad) and deflection.size > 1:
+        from .units import GRADIENT, fmt_num
+
+        slope = cfg.unit_system.from_internal(GRADIENT, grad)
         w_line = np.linspace(0.0, deflection.max(), 20)
-        ax.plot(w_line, grad * w_line, "--", lw=1.0,
-                label=f"fit dP/dw = {grad:.1f} N/mm")
-    ax.set_xlabel("mid-span deflection w (mm)", fontsize=8)
-    ax.set_ylabel("force P (N)", fontsize=8)
+        ax.plot(w_line, slope * w_line, "--", lw=1.0,
+                label=f"fit $dP/dw$ = {fmt_num(slope)}"
+                      f"{_unit_suffix(cfg, GRADIENT)}")
+    ax.set_xlabel("mid-span deflection $w$" + _unit_suffix(cfg, LENGTH),
+                  fontsize=8)
+    ax.set_ylabel("force $P$" + _unit_suffix(cfg, FORCE), fontsize=8)
     ax.tick_params(labelsize=7.5)
     ax.set_title(f"Load–deflection — {results.cfg.name}", fontsize=10)
     _apply_style(fig)
@@ -203,39 +353,179 @@ def fig_load_deflection(results, ax=None):
 
 
 def fig_thickness_profile(results, axs=None):
-    """Sigma_xx and tau_xz through the thickness at mid-span."""
+    """Bending and shear stress through the laminate thickness at mid-span.
+
+    Each stackup layer is drawn as a shaded band so the stress can be read
+    *inside* the layer it belongs to, and the area between the stress
+    curve and the zero axis is filled with a diverging colour map: red
+    where the material is in tension, blue where it is in compression (in
+    the shear panel the two colours give the sense of the shear flow).
+
+    This is what makes a sandwich section readable at a glance -- the
+    bending stress steps across every face/core interface because the
+    faces and the core carry the same strain with very different moduli,
+    and the neutral axis is exactly where the fill changes sign.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib as mpl
+    import matplotlib.transforms as mtransforms
+
+    cfg = results.cfg
+    prof = results.profile
+    z_internal = np.asarray(prof["z"], dtype=float)
+    order = np.argsort(z_internal)
+    z = _display(cfg, LENGTH, z_internal[order])
+    layer = np.asarray(
+        prof.get("layer", np.zeros_like(z_internal, dtype=int)), dtype=int
+    )[order]
+    n_layers = len(cfg.stackup)
+    colors = _material_colors(cfg)
+    cmap = mpl.colormaps[_STRESS_CMAP]
+
+    series = [
+        (np.asarray(prof["sigma_xx"], float)[order], r"$\sigma_{xx}$",
+         "bending stress"),
+        (np.asarray(prof["tau_xz"], float)[order], r"$\tau_{xz}$",
+         "shear stress"),
+    ]
+
+    created_here = axs is None
+    if created_here:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10.4, 4.8),
+                                       dpi=_DPI_PNG, sharey=True)
+        fig.subplots_adjust(left=0.085, right=0.885, top=0.88, bottom=0.12,
+                            wspace=0.42)
+    else:
+        ax1, ax2 = axs
+        fig = ax1.figure
+
+    bounds = list(_display(cfg, LENGTH, cfg.layer_z_bounds))
+    z_na = cfg.unit_system.from_internal(
+        LENGTH, layup_flexural_rigidity(cfg)["neutral_axis_z"]
+    )
+    _layer_bands(ax1, cfg, colors)
+    ax1.axhline(z_na, color="crimson", linestyle="--", linewidth=1.0,
+                zorder=3)
+    ax1.text(0.02, z_na, f" neutral axis  $z_{{NA}}$ = {z_na:.4g}",
+             transform=mtransforms.blended_transform_factory(
+                 ax1.transAxes, ax1.transData),
+             va="bottom", ha="left", fontsize=7.5, color="crimson")
+
+    mappable = None
+    for ax, (vals_internal, symbol, title) in zip((ax1, ax2), series):
+        vals = _display(cfg, STRESS, vals_internal)
+        z_trend, v_trend = _layer_trend(z, vals, layer, n_layers)
+        vmax = float(np.max(np.abs(v_trend))) if v_trend.size else 1.0
+        vmax = vmax if vmax > 0 else 1.0
+        norm = mpl.colors.Normalize(-vmax, vmax)
+        _layer_bands(ax, cfg, colors)
+        _fill_stress_area(ax, z_trend, v_trend, norm, cmap)
+        ax.plot(vals, z, "o", ms=2.6, mfc="none", mec="0.35",
+                mew=0.6, zorder=5, label="recovered samples")
+        ax.plot(v_trend, z_trend, "-", color="0.12", linewidth=1.4,
+                zorder=6, label="fitted trend")
+        ax.axvline(0.0, color="0.35", linewidth=0.7, zorder=3)
+        ax.set_xlim(-1.18 * vmax, 1.18 * vmax)
+        ax.set_xlabel(symbol + _unit_suffix(cfg, STRESS), fontsize=8.5)
+        ax.set_title(title, fontsize=9.5)
+        ax.tick_params(labelsize=7.5)
+        mappable = mpl.cm.ScalarMappable(norm=norm, cmap=cmap)
+
+    ax1.set_ylabel("z" + _unit_suffix(cfg, LENGTH) + "  (bottom → top)",
+                   fontsize=8.5)
+    ax1.set_ylim(bounds[0], bounds[-1])
+    _layer_labels(ax1, cfg, bounds, colors)
+    ax1.legend(fontsize=7, loc="lower left", framealpha=0.85)
+
+    if created_here:
+        cax = fig.add_axes([0.905, 0.12, 0.016, 0.76])
+        cb = fig.colorbar(mappable, cax=cax)
+        cb.set_label(f"stress{_unit_suffix(cfg, STRESS)}\n"
+                     "red = tension / +\nblue = compression / −",
+                     fontsize=7.5)
+        cb.ax.tick_params(labelsize=7)
+        fig.suptitle(
+            f"Mid-span through-thickness stress — {cfg.name}",
+            fontsize=10, y=0.965,
+        )
+    _apply_style(fig)
+    return fig
+
+
+def fig_stress_along_span(results, axs=None):
+    """Bending and shear stress along the beam axis, per layer station.
+
+    The companion to the thickness profile: three-point bending drives
+    bending stress from mid-span and shear stress from the supports, so
+    the same recovered stress is sampled here at the mid-thickness of the
+    bottom face, the core and the top face. The load roller and the
+    supports are marked so the peaks can be read against the test setup.
+    """
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    prof = results.profile
-    z = prof["z"]
-    sxx = prof["sigma_xx"]
-    sxz = prof["tau_xz"]
+    cfg = results.cfg
+    span = getattr(results, "span_profile", None) or {}
+    x = span.get("x")
+    if x is None or len(span.get("sigma_xx", [])) == 0:
+        return fig_load_deflection(results)  # nothing sampled: stay usable
+
+    layer_colors = _layer_colors(cfg)
+    stations = list(zip(span["station_layer"], span["station_label"]))
+    # each station carries its own x, in case a layer lost a node
+    xs = span.get("x_station") or [x] * len(stations)
 
     if axs is None:
-        fig, (ax1, ax2) = plt.subplots(1, 2, sharey=True, figsize=(9, 4.5),
-                                       dpi=_DPI_PNG)
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8.2, 6.0),
+                                       dpi=_DPI_PNG, sharex=True)
     else:
         ax1, ax2 = axs
         fig = ax1.figure
-    ax1.plot(sxx, z, "o-", ms=3, lw=1.2)
-    ax1.set_xlabel(r"$\sigma_{xx}$ (MPa)", fontsize=8)
-    ax1.set_ylabel("z (mm)", fontsize=8)
-    ax1.set_title("bending stress", fontsize=9)
-    ax2.plot(sxz, z, "s-", ms=3, lw=1.2, color="tab:red")
-    ax2.set_xlabel(r"$\tau_{xz}$ (MPa)", fontsize=8)
-    ax2.set_title("shear stress", fontsize=9)
-    for a in (ax1, ax2):
-        a.tick_params(labelsize=7.5)
+
+    for ax, key, symbol, title in (
+        (ax1, "sigma_xx", r"$\sigma_{xx}$",
+         "bending stress along the span (peak at mid-span)"),
+        (ax2, "tau_xz", r"$\tau_{xz}$",
+         "shear stress along the span"),
+    ):
+        for (layer, label), values, xi in zip(stations, span[key], xs):
+            ax.plot(_display(cfg, LENGTH, np.asarray(xi, dtype=float)),
+                    _display(cfg, STRESS, np.asarray(values, float)),
+                    lw=1.4, color=layer_colors.get(int(layer), "0.3"),
+                    label=f"{label} — layer {int(layer) + 1}")
+        ax.axhline(0.0, color="0.35", linewidth=0.7)
+        ax.set_ylabel(symbol + _unit_suffix(cfg, STRESS), fontsize=8.5)
+        ax.set_title(title, fontsize=9)
+        ax.tick_params(labelsize=7.5)
+        ax.legend(fontsize=7.5, loc="best")
+
+    # test setup markers: load roller at mid-span, supports at +-span/2
+    half = cfg.half_model
+    load_x = 0.0
+    support_x = ([cfg.geometry.span / 2.0] if half
+                 else [-cfg.geometry.span / 2.0, cfg.geometry.span / 2.0])
+    for ax in (ax1, ax2):
+        ax.axvline(cfg.unit_system.from_internal(LENGTH, load_x),
+                   color="0.65", linewidth=0.8, linestyle="-.", zorder=0)
+        for s in support_x:
+            ax.axvline(cfg.unit_system.from_internal(LENGTH, s),
+                       color="0.65", linewidth=0.8, linestyle="--", zorder=0)
+
+    ax2.set_xlabel("x" + _unit_suffix(cfg, LENGTH), fontsize=8.5)
+    ax1.text(0.01, 0.96, "vertical lines: dashed = supports, "
+             "dash-dot = load roller", transform=ax1.transAxes,
+             va="top", ha="left", fontsize=7, color="0.4")
+    ax1.margins(x=0.02)
     if axs is None:
-        fig.suptitle(
-            f"Mid-span through-thickness profile — {results.cfg.name}",
-            fontsize=10,
-        )
+        fig.suptitle(f"Stress distribution along the span — {cfg.name}",
+                     fontsize=10)
         _apply_style(fig)
-        fig.tight_layout()
+        fig.tight_layout(rect=(0, 0, 1, 0.95))
     else:
         _apply_style(fig)
     return fig
@@ -276,5 +566,10 @@ def save_all_figures(results, plot_dir: str) -> Dict[str, Dict[str, str]]:
         saved["thickness_profile"] = save_figure(
             fig_thickness_profile(results),
             os.path.join(plot_dir, "thickness_profile"),
+        )
+    if getattr(results, "span_profile", None):
+        saved["stress_along_span"] = save_figure(
+            fig_stress_along_span(results),
+            os.path.join(plot_dir, "stress_along_span"),
         )
     return saved

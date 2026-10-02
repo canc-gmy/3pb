@@ -2,9 +2,21 @@
 
 Run inside the sandwich3pb conda environment:
     python examples/run_reference.py
+
+Results are printed in the unit system the case file declares, so this
+script prints m / Pa / N for the SI reference case and mm / MPa / N for a
+case written with ``units: mm_n_mpa``.
 """
 
 from sandwich3pb import load_config, run_case
+from sandwich3pb.units import (
+    FORCE,
+    GRADIENT,
+    LENGTH,
+    NONE,
+    RIGIDITY,
+    fmt_qty,
+)
 
 if __name__ == "__main__":
     cfg = load_config("examples/case_glass_pvc.yaml")
@@ -12,16 +24,22 @@ if __name__ == "__main__":
     results = run_case(cfg, out_dir="results/glass_pvc_reference")
 
     s = results.summary
-    print("\n--- extracted results ---")
-    print(f"max force P        : {s['max_force_N']:.2f} N")
-    print(f"max deflection w   : {s['max_deflection_mm']:.4f} mm")
-    print(f"force gradient dP/dw: {s['force_gradient_N_per_mm']:.2f} N/mm "
-          f"(R2 = {s['gradient_fit_r2']:.4f})")
-    print(f"apparent rigidity D: {s['apparent_flexural_rigidity_Nmm2']:.4g} N.mm2")
-    print(f"layup rigidity EI  : {s['layup_flexural_rigidity_Nmm2']:.4g} N.mm2")
-    print(f"ratio D/EI         : {s['rigidity_ratio_FE_over_layup']:.3f}")
-    print(f"force balance resid: {s['force_balance_residual']:.2e}")
-    print(f"max Tsai-Wu (faces): {s['max_tsai_wu_faces']}")
-    print(f"core shear util.   : {s['max_core_shear_ratio']}")
-    print(f"core crushing util.: {s['max_core_crushing_ratio']}")
+    u = cfg.unit_system
+
+    def q(key, dim):
+        return fmt_qty(s[key], u, dim)
+
+    print(f"\n--- extracted results ({u.name}: length {u.length}, "
+          f"stress {u.stress}, force {u.force}) ---")
+    print(f"max force P        : {q('max_force_N', FORCE)}")
+    print(f"max deflection w   : {q('max_deflection_mm', LENGTH)}")
+    print(f"force gradient dP/dw: {q('force_gradient_N_per_mm', GRADIENT)} "
+          f"(R2 = {fmt_qty(s['gradient_fit_r2'], u, NONE)})")
+    print(f"apparent rigidity D: {q('apparent_flexural_rigidity_Nmm2', RIGIDITY)}")
+    print(f"layup rigidity EI  : {q('layup_flexural_rigidity_Nmm2', RIGIDITY)}")
+    print(f"ratio D/EI         : {fmt_qty(s['rigidity_ratio_FE_over_layup'], u, NONE)}")
+    print(f"force balance resid: {fmt_qty(s['force_balance_residual'], u, NONE)}")
+    print(f"max Tsai-Wu (faces): {fmt_qty(s['max_tsai_wu_faces'], u, NONE)}")
+    print(f"core shear util.   : {fmt_qty(s['max_core_shear_ratio'], u, NONE)}")
+    print(f"core crushing util.: {fmt_qty(s['max_core_crushing_ratio'], u, NONE)}")
     print("\nreport written to results/glass_pvc_reference/report.(md|html|pdf)")

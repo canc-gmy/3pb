@@ -1,13 +1,14 @@
 """Configuration schema, YAML loading and validation for sandwich3pb.
 
-Units convention (used consistently across the package):
-    length : mm
-    force  : N
-    stress : MPa  (= N/mm^2)
+Units: a case file declares its system explicitly with ``units: si``
+(m, Pa, N) or ``units: mm_n_mpa`` (mm, MPa, N). Everything is converted at
+this boundary to the single **internal** system the solver works in --
+length mm, force N, stress MPa -- so case files can be written in SI
+without re-tuning the validated solver core. See :mod:`sandwich3pb.units`.
 
 The stackup is given bottom -> top (increasing z). Each layer references a
-material by name and carries its thickness (mm) and fibre orientation in
-degrees (rotation of the material 1-axis about the global width/y axis).
+material by name and carries its thickness and fibre orientation in degrees
+(rotation of the material 1-axis about the global width/y axis).
 """
 
 from __future__ import annotations
@@ -16,6 +17,13 @@ from dataclasses import dataclass, field, fields, is_dataclass
 from typing import Any, Dict, List, Optional, get_type_hints
 
 import yaml
+
+from .units import (
+    DEFAULT_SYSTEM,
+    get_units,
+    scale_config_dict,
+    scale_raw_config,
+)
 
 
 # --------------------------------------------------------------------------
@@ -128,6 +136,7 @@ class SolverSpec:
 class Config:
     name: str = "sandwich3pb_case"
     output_dir: str = "results"
+    units: str = DEFAULT_SYSTEM.name  # unit system of the *case file*
     geometry: GeometrySpec = field(default_factory=GeometrySpec)
     materials: Dict[str, MaterialSpec] = field(default_factory=dict)
     stackup: List[LayerSpec] = field(default_factory=list)
@@ -136,6 +145,14 @@ class Config:
     loading: LoadingSpec = field(default_factory=LoadingSpec)
     solver: SolverSpec = field(default_factory=SolverSpec)
     half_model: bool = False  # model only half the span with a symmetry BC
+
+    @property
+    def unit_system(self):
+        """The unit system this case is *presented* in (reports, figures).
+
+        All fields above are in internal units (mm, N, MPa) regardless.
+        """
+        return get_units(self.units)
 
     # ---- derived quantities -------------------------------------------------
     @property
@@ -239,12 +256,38 @@ def _parse_stackup(raw: Any) -> List[LayerSpec]:
 
 
 def load_config(path: str) -> Config:
-    """Load and validate a YAML case file."""
+    """Load and validate a YAML case file.
+
+    The file must declare ``units:``. SI and mm/MPA differ by 1000x in
+    length and 1e6 in stress, so the system is never guessed -- a missing
+    or unknown key is a validation error rather than a silent
+    misinterpretation. Values are converted to internal units here, at the
+    only boundary where the file format is known.
+    """
     with open(path, "r") as handle:
         raw = yaml.safe_load(handle) or {}
+    if not isinstance(raw, dict):
+        raise ValueError("Invalid configuration:\n  - case file must be a mapping")
+
+    if "units" not in raw:
+        raise ValueError(
+            "Invalid configuration:\n"
+            "  - case file must declare `units:` (the length/stress system it "
+            "is written in)\n"
+            "    use `units: si` for m/Pa/N or `units: mm_n_mpa` for mm/MPa/N"
+        )
+    units_name = str(raw["units"]).strip().lower()
+    try:
+        unit_system = get_units(units_name)
+    except ValueError as exc:
+        raise ValueError(f"Invalid configuration:\n  - {exc}") from None
+
+    raw = scale_raw_config(raw, unit_system)
+
     cfg = Config(
         name=raw.get("name", "sandwich3pb_case"),
         output_dir=raw.get("output_dir", "results"),
+        units=unit_system.name,
         geometry=_fill_dataclass(GeometrySpec, raw.get("geometry", {})),
         materials=_parse_materials(raw.get("materials", {})),
         stackup=_parse_stackup(raw.get("stackup", [])),
@@ -259,7 +302,12 @@ def load_config(path: str) -> Config:
 
 
 def config_to_yaml_dict(cfg: Config) -> Dict[str, Any]:
-    """Inverse of load_config (for echoing the config into results)."""
+    """Inverse of load_config, in the *case file's* units.
+
+    Values are converted back from internal units so the ``case_used.yaml``
+    echo of a run round-trips through :func:`load_config` unchanged, in
+    whatever units the author wrote.
+    """
 
     def asdict(obj: Any) -> Any:
         if is_dataclass(obj):
@@ -275,7 +323,8 @@ def config_to_yaml_dict(cfg: Config) -> Dict[str, Any]:
         return obj
 
     d = asdict(cfg)
-    return d
+    d.pop("units", None)  # re-added below, already in the file's spelling
+    return scale_config_dict(d, cfg.unit_system) | {"units": cfg.units}
 
 
 # --------------------------------------------------------------------------

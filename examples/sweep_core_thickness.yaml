@@ -1,5 +1,8 @@
 # Sweep over core thickness (fast coarse mesh).
 # Run:  sandwich3pb sweep examples/sweep_core_thickness.yaml
+# Units: SI (m, N, Pa) — see `units:` below.
+
+units: si
 
 name: core_thickness_sweep
 output_dir: results
@@ -9,44 +12,44 @@ sweep:
   parallel: 1
 
 geometry:
-  length: 300
-  span: 200
-  width: 40
+  length: 0.300
+  span: 0.200
+  width: 0.040
 
 materials:
   glass_epoxy:
     kind: orthotropic
-    E1: 39000.0
-    E2: 9000.0
-    E3: 9000.0
+    E1: 3.9e10
+    E2: 9.0e9
+    E3: 9.0e9
     nu12: 0.28
     nu13: 0.28
     nu23: 0.40
-    G12: 3800.0
-    G13: 3800.0
-    G23: 3200.0
-    Xt: 900.0
-    Xc: 750.0
-    Yt: 45.0
-    Yc: 140.0
-    S: 55.0
+    G12: 3.8e9
+    G13: 3.8e9
+    G23: 3.2e9
+    Xt: 9.0e8
+    Xc: 7.5e8
+    Yt: 4.5e7
+    Yc: 1.4e8
+    S: 5.5e7
   pvc_foam:
     kind: isotropic
-    E: 75.0
+    E: 7.5e7
     nu: 0.30
-    shear: 0.80
-    compression: 1.10
+    shear: 8.0e5
+    compression: 1.1e6
 
 stackup:
   - material: glass_epoxy
-    thickness: 1.5
+    thickness: 1.5e-3
     fibre_orientation: 0.0
     role: face
   - material: pvc_foam
-    thickness: [15.0, 20.0, 25.0]     # <-- swept parameter
+    thickness: [15.0e-3, 20.0e-3, 25.0e-3]   # <-- swept parameter (m)
     role: core
   - material: glass_epoxy
-    thickness: 1.5
+    thickness: 1.5e-3
     fibre_orientation: 0.0
     role: face
 
@@ -59,17 +62,17 @@ mesh:
   element_order: 2      # Q2: no transverse-shear locking
 
 contact:
-  penalty: 1.0e6
-  roller_radius_load: 10.0
-  roller_radius_support: 5.0
+  penalty: 1.0e15
+  roller_radius_load: 10.0e-3
+  roller_radius_support: 5.0e-3
   augmented_lagrangian:
     enabled: true
     max_outer: 6
-    tol: 2.0e-3
+    tol: 2.0e-6
     update_rate: 10.0
 
 loading:
-  max_indentation: 1.5
+  max_indentation: 1.5e-3
   n_steps: 6
 
 solver:

@@ -8,25 +8,45 @@ from typing import Any, Dict
 
 import numpy as np
 
+from .units import LENGTH, STRESS, FORCE
+
 
 def write_case_outputs(results, out_dir: str) -> Dict[str, str]:
     """Write load-deflection CSV, midspan profile CSV, summary JSON, XDMF
-    fields and plots. Returns a mapping of artifact name -> path."""
+    fields and plots. Returns a mapping of artifact name -> path.
+
+    CSV values are written in the *case file's* units (m/Pa/N for an SI
+    case, mm/MPa/N otherwise), so the numbers match the case that was run
+    and the report; the column headers carry the unit symbols and the
+    summary JSON repeats the system under ``units``.
+    """
     os.makedirs(out_dir, exist_ok=True)
     paths: Dict[str, str] = {}
+    units = results.cfg.unit_system
+
+    def out(dim: str, value: float) -> float:
+        return units.from_internal(dim, float(value))
+
+    L, S, F = units.length, units.stress, units.force
 
     # ---- load-deflection history -------------------------------------------
     hist_path = os.path.join(out_dir, "load_deflection.csv")
     with open(hist_path, "w") as f:
         f.write(
-            "step,travel_mm,force_N,deflection_mm,support_forces_N,"
-            "max_violation_mm,newton_iterations,al_iterations,converged\n"
+            f"step,travel_{L},force_{F},deflection_{L},support_forces_{F},"
+            f"max_violation_{L},newton_iterations,al_iterations,converged\n"
         )
         for row in results.history:
+            reactions = ", ".join(
+                f"{out(FORCE, r):.6g}" for r in row["support_forces_N"]
+            )
             f.write(
-                f"{row['step']},{row['travel_mm']:.6g},{row['force_N']:.6g},"
-                f"{row['deflection_mm']:.6g},\"{row['support_forces_N']}\","
-                f"{row['max_violation_mm']:.3e},{row['newton_iterations']},"
+                f"{row['step']},{out(LENGTH, row['travel_mm']):.6g},"
+                f"{out(FORCE, row['force_N']):.6g},"
+                f"{out(LENGTH, row['deflection_mm']):.6g},"
+                f"\"{reactions}\","
+                f"{out(LENGTH, row['max_violation_mm']):.3e},"
+                f"{row['newton_iterations']},"
                 f"{row['al_iterations']},{row['converged']}\n"
             )
     paths["load_deflection_csv"] = hist_path
@@ -35,15 +55,53 @@ def write_case_outputs(results, out_dir: str) -> Dict[str, str]:
     prof = results.profile
     prof_path = os.path.join(out_dir, "profile_midspan.csv")
     with open(prof_path, "w") as f:
-        f.write("z_mm,sigma_xx_MPa,tau_xz_MPa,layer_index\n")
+        f.write(f"z_{L},sigma_xx_{S},tau_xz_{S},layer_index\n")
         for z, sxx, sxz, lay in zip(
             prof["z"], prof["sigma_xx"], prof["tau_xz"], prof["layer"]
         ):
-            f.write(f"{z:.6g},{sxx:.6g},{sxz:.6g},{lay}\n")
+            f.write(
+                f"{out(LENGTH, z):.6g},{out(STRESS, sxx):.6g},"
+                f"{out(STRESS, sxz):.6g},{lay}\n"
+            )
     paths["profile_midspan_csv"] = prof_path
+
+    # ---- stress along the span ----------------------------------------------
+    span = getattr(results, "span_profile", None) or {}
+    # ``beam_axis_profile`` stores one array per layer *station*; the x
+    # stations are shared. Check emptiness with ``len``, not truthiness:
+    # x is a numpy array, whose truth value is ambiguous.
+    span_x = span.get("x")
+    stations = list(span.get("sigma_xx") or [])
+    if span_x is not None and len(span_x) > 0 and stations:
+        span_path = os.path.join(out_dir, "profile_span.csv")
+        layers = span.get("station_layer") or list(range(len(stations)))
+        labels = span.get("station_label") or [""] * len(stations)
+        shear = span.get("tau_xz") or [np.zeros_like(s) for s in stations]
+        # each station keeps its own x: a layer can be missing a node or
+        # two, and the arrays must stay aligned
+        xs = span.get("x_station") or [span_x] * len(stations)
+        with open(span_path, "w") as f:
+            f.write(
+                f"layer_index,station_material,x_{L},"
+                f"sigma_xx_{S},tau_xz_{S}\n"
+            )
+            for layer, label, x, sxx, sxz in zip(
+                layers, labels, xs, stations, shear
+            ):
+                for xi, si, ti in zip(
+                    np.asarray(x, float),
+                    np.asarray(sxx, float),
+                    np.asarray(sxz, float),
+                ):
+                    f.write(
+                        f"{int(layer)},{label},{out(LENGTH, xi):.6g},"
+                        f"{out(STRESS, si):.6g},{out(STRESS, ti):.6g}\n"
+                    )
+        paths["profile_span_csv"] = span_path
 
     # ---- summary JSON --------------------------------------------------------
     summary = dict(results.summary)
+    summary["units"] = units.name
     summary["config"] = _config_to_dict(results.cfg)
 
     def _default(obj: Any) -> Any:

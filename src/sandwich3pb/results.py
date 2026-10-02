@@ -9,6 +9,7 @@ import numpy as np
 
 from .config import Config
 from .postprocess import (
+    beam_axis_profile,
     failure_indices,
     layup_flexural_rigidity,
     midspan_profile,
@@ -62,6 +63,7 @@ class CaseResults:
     summary: Dict[str, Any]
     history: List[Dict[str, Any]]
     profile: Dict[str, np.ndarray]
+    span_profile: Dict[str, object] = field(default_factory=dict)
     stress_nodal: Optional[np.ndarray] = None   # (n_nodes, n_layers, 6)
     stress_counts: Optional[np.ndarray] = None
     solution: Optional[Solution] = field(default=None, repr=False)
@@ -101,6 +103,7 @@ class CaseResults:
             u_z_fe=solution.u_z_fe(),
             fe_points=solution.fe_points,
         )
+        span_profile = beam_axis_profile(stress, counts, solution.mesh_data, cfg)
 
         roles = cfg.resolve_roles()
         face_tw = [
@@ -174,6 +177,7 @@ class CaseResults:
                 for r in hist
             ],
             profile=profile,
+            span_profile=span_profile,
             stress_nodal=stress,
             stress_counts=counts,
             solution=solution,
