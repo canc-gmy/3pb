@@ -85,6 +85,17 @@ def _fmt(v: Any, digits: int = 4) -> str:
     return f"{f:.{digits}g}"
 
 
+def _esc(s: str) -> str:
+    """LaTeX‑escape a few characters."""
+    s = s.replace("%", r"\%")
+    s = s.replace("&", r"\&")
+    s = s.replace("#", r"\#")
+    s = s.replace("_", r"\_")
+    s = s.replace("{", r"\{")
+    s = s.replace("}", r"\}")
+    return s
+
+
 def _unit_cell(dim: str, units: UnitSystem) -> str:
     r"""The unit as its own table cell, e.g. ``$\mathrm{mm}$``.
 
@@ -136,13 +147,15 @@ def _axial_moduli(cfg: Config) -> List[float]:
 QUANTITY_HEADER: List[str] = ["quantity", "value", "unit"]
 
 
-def _layup_rows(cfg: Config) -> Tuple[List[str], List[List[str]]]:
-    units = cfg.unit_system
+def _layup_rows(cfg: Config, unit_system: Optional[UnitSystem] = None) -> Tuple[List[str], List[List[str]]]:
+    units = unit_system or cfg.unit_system
+    sym_len = units.tex_symbol(LENGTH)
+    sym_stress = units.tex_symbol(STRESS)
     header = [
         "#", "role", "material",
-        "thickness", "unit",
+        f"thickness ({sym_len})", "unit",
         f"fibre orientation {tex(chr(92) + 'theta')} (deg)",
-        "$E_x$", "unit",
+        f"$E_x$ ({sym_stress})", "unit",
     ]
     roles = cfg.resolve_roles()
     E_x = _axial_moduli(cfg)
@@ -164,20 +177,25 @@ def _layup_rows(cfg: Config) -> Tuple[List[str], List[List[str]]]:
 
 
 def _model_rows(
-    cfg: Config, summary: Dict[str, Any]
+    cfg: Config, summary: Dict[str, Any], u: Optional[UnitSystem] = None
 ) -> Tuple[List[str], List[List[str]]]:
-    u = cfg.unit_system
+    if u is None:
+        u = DEFAULT_SYSTEM
     g = cfg.geometry
     c = cfg.contact
+
+    sym_len = u.tex_symbol(LENGTH)
+    sym_force = u.tex_symbol(FORCE)
+    sym_penalty = u.tex_symbol(PENALTY)
 
     def length(value) -> List[str]:
         return [_num(value, u, LENGTH), _unit_cell(LENGTH, u)]
 
     rows = [
-        ["beam length " + tex("L"), *length(g.length)],
-        ["span (support distance) " + tex(r"L_s"), *length(g.span)],
-        ["width " + tex("b"), *length(g.width)],
-        ["total thickness " + tex("t"), *length(cfg.total_thickness)],
+        ["beam length " + tex("L") + f" ({sym_len})", *length(g.length)],
+        ["span (support distance) " + tex(r"L_s") + f" ({sym_len})", *length(g.span)],
+        ["width " + tex("b") + f" ({sym_len})", *length(g.width)],
+        ["total thickness " + tex("t") + f" ({sym_len})", *length(cfg.total_thickness)],
         ["load roller radius", *length(c.roller_radius_load)],
         ["support roller radius", *length(c.roller_radius_support)],
         ["max indentation", *length(cfg.loading.max_indentation)],
@@ -195,6 +213,9 @@ def _global_rows(
     summary: Dict[str, Any], units: Optional[UnitSystem] = None
 ) -> Tuple[List[str], List[List[str]]]:
     u = units or DEFAULT_SYSTEM
+    sym_force = u.tex_symbol(FORCE)
+    sym_length = u.tex_symbol(LENGTH)
+    sym_rigidity = u.tex_symbol(RIGIDITY)
 
     def q(key: str, dim: str, digits: int = 4) -> List[str]:
         return [_num(summary.get(key), u, dim, digits), _unit_cell(dim, u)]
@@ -203,14 +224,11 @@ def _global_rows(
         return fmt_tex_num(summary.get(key), digits)
 
     rows = [
-        ["max force " + tex(r"P_{\max}"), *q("max_force_N", FORCE)],
-        ["deflection at max force " + tex("w"),
-         *q("deflection_at_max_force_mm", LENGTH)],
-        ["max deflection " + tex(r"w_{\max}"),
-         *q("max_deflection_mm", LENGTH)],
+        ["max force " + tex(r"P_{\max}") + f" ({sym_force})", *q("max_force_N", FORCE)],
+        ["deflection at max force " + tex("w"), *q("deflection_at_max_force_mm", LENGTH)],
+        ["max deflection " + tex(r"w_{\max}"), *q("max_deflection_mm", LENGTH)],
         ["final roller travel", *q("final_travel_mm", LENGTH)],
-        ["force gradient " + tex(r"\frac{dP}{dw}"),
-         *q("force_gradient_N_per_mm", GRADIENT)],
+        ["force gradient " + tex(r"\frac{dP}{dw}"), *q("force_gradient_N_per_mm", GRADIENT)],
         ["gradient fit " + tex("R^2"), n("gradient_fit_r2", 3), "—"],
         ["apparent flexural rigidity " + tex("D") + " (FE)",
          *q("apparent_flexural_rigidity_Nmm2", RIGIDITY)],
@@ -260,6 +278,208 @@ def _global_rows(
 
 
 #: Rows of the global table promoted to the headline summaries.
+def _kpi_table(summary: Dict[str, Any], units: Optional[UnitSystem] = None) -> str:
+    """Render the headline KPI numbers as a Markdown table body.
+
+    Replaces the former inline ``" · ".join(...)`` with a left-aligned label
+    column and a right-aligned value+unit column.  Returns only the table
+    body; the caller adds the ``**At a glance:**`` header.
+    """
+    u = units or DEFAULT_SYSTEM
+    rows = _kpi_rows(summary, u)
+    if not rows:
+        return ""
+    col_width = max(
+        max(len(str(row[0])) for row in rows),
+        max(len(str(row[1])) for row in rows),
+    )
+    def line(label: str, value: str, unit: str) -> str:
+        unit_part = f" {unit}" if str(unit) != "—" else ""
+        return f"| {label.ljust(col_width)} | {value}{unit_part} |"
+    body = "\n".join(line(row[0], str(row[1]), row[2]) for row in rows)
+    return body
+
+
+def _latex_column_spec(numeric_cols: Optional[set]) -> str:
+    """Return a LaTeX column specification string from a set of numeric column indices.
+
+    In LaTeX, ``l`` = left-aligned, ``c`` = centered, ``r`` = right-aligned.
+    Markdown's ``:--`` (right) maps to ``r``, ``--`` (left) maps to ``l``,
+    and ``:-:`` (center) maps to ``c``.  We default left-alignment for all
+    columns and override those in ``numeric_cols`` to right-aligned.
+    """
+    n = None  # we'll infer from the first caller's header length at render time
+    # We return a placeholder; the actual spec will be built per-table.
+    return "l"  # default, will be overridden
+
+
+def build_latex(results) -> str:
+    """Generate a LaTeX ``report.tex`` string from *results*.
+
+    The output uses the ``article`` class with ``booktabs`` and
+    ``tabular`` environments for all tables, and ``figure`` placeholders
+    for the generated plots.  It reuses the same data structures as
+    ``build_markdown`` so the same numbers appear in both outputs.
+
+    The returned string can be written to ``report.tex`` and compiled
+    with ``pdflatex`` for publication-quality PDF, or simply read as
+    structured source.
+    """
+    cfg = results.cfg
+    s = results.summary
+    u = cfg.unit_system
+
+    # ------------------------------------------------------------------
+    # Layup table
+    # ------------------------------------------------------------------
+    layup_header, layup_rows = _layup_rows(cfg, u)
+    # Build LaTeX column spec: first three columns are left (label/role/material),
+    # then value columns right, then unit columns left.  We determine this from
+    # the header layout: #, role, material, thickness(E_x), unit, fibre orient, Ex, unit
+    # Numeric (right‑aligned) are thickness and E_x → columns 3 and 6 (0‑based).
+    layup_numerics = {3, 6}
+    layup_spec = "".join(
+        "r" if i in layup_numerics else "l" for i in range(len(layup_header))
+    )
+
+    layup_tabular = _build_latex_tabular(layup_header, layup_rows, layup_spec)
+
+    # ------------------------------------------------------------------
+    # Model table
+    # ------------------------------------------------------------------
+    model_header, model_rows = _model_rows(cfg, s, u)
+    model_numerics = {1}  # value column
+    model_spec = "".join("r" if i in model_numerics else "l" for i in range(len(model_header)))
+    model_tabular = _build_latex_tabular(model_header, model_rows, model_spec)
+
+    # ------------------------------------------------------------------
+    # Global results table
+    # ------------------------------------------------------------------
+    global_header, global_rows = _global_rows(s, u)
+    global_numerics = {1}  # value column
+    global_spec = "".join("r" if i in global_numerics else "l" for i in range(len(global_header)))
+    global_tabular = _build_latex_tabular(global_header, global_rows, global_spec)
+
+    # ------------------------------------------------------------------
+    # Failure indices table
+    # ------------------------------------------------------------------
+    f_header, f_rows = _failure_rows(s, u)
+    # In the failure table the numeric columns are max value (4) and limit (5)
+    failure_numerics = {4, 5}
+    failure_spec = "".join("r" if i in failure_numerics else "l" for i in range(len(f_header)))
+    failure_tabular = _build_latex_tabular(f_header, f_rows, failure_spec)
+
+    # ------------------------------------------------------------------
+    # Figure placeholders
+    # ------------------------------------------------------------------
+    plots_dir = getattr(results, "_plots_dir", "plots")
+    figs = {}
+    for name in ("laminate_stackup", "load_deflection", "thickness_profile",
+                 "stress_along_span"):
+        path = os.path.join(plots_dir, f"{name}.svg")
+        figs[name] = f"\\begin{{figure}}[htbp]\\centering\\includegraphics[width=\\linewidth]{{{name}.svg}}\\caption{{{name.replace('_', ' ')}}}\\end{{figure}}"
+
+    # ------------------------------------------------------------------
+    # Assemble the full LaTeX document
+    # ------------------------------------------------------------------
+    lines = [
+        r"\documentclass{article}",
+        r"\usepackage[utf8]{inputenc}",
+        r"\usepackage[T1]{fontenc}",
+        r"\usepackage{booktabs}",
+        r"\usepackage{graphicx}",
+        r"\usepackage{amsmath}",
+        r"\begin{document}",
+        f"\n\\title{{Three-Point Bending Report — {_esc(cfg.name)}}}",
+        f"\\maketitle",
+        "",
+        f"All quantities are given in the case file's own units "
+        f"(``{u.name}`` — length {u.length}, stress {u.stress}, "
+        f"force {u.force}).  Every value sits in its own column with the "
+        "unit in the column beside it.",
+        "",
+        "## Layup / stackup",
+        "",
+        layup_tabular,
+        "",
+        "## Model",
+        "",
+        model_tabular,
+        "",
+        "## Global results",
+        "",
+        global_tabular,
+        "",
+        "## Failure indices",
+        "",
+        failure_tabular,
+        "",
+    ]
+    lines.append("")
+    lines.append(r"\section*{Laminate cross-section (true thickness)}")
+    lines.append(figs.get("laminate_stackup", ""))
+    lines.append("")
+    lines.append(r"Through-thickness axis at true scale; the beam axis is compressed")
+    lines.append("for readability.")
+    lines.append("")
+    lines.append(r"\section*{Load--deflection}")
+    lines.append(figs.get("load_deflection", ""))
+    lines.append("")
+    lines.append(r"\section*{Mid-span through-thickness profile}")
+    lines.append(figs.get("thickness_profile", ""))
+    lines.append("")
+    lines.append(r"The plot shows the grid-corner recovered stress averaged across beam width,")
+    lines.append("separately within each material layer; stress can jump at bonded interfaces.")
+    lines.append("Red indicates positive/tensile stress and blue negative/compressive stress.")
+    lines.append("Markers are recovery samples; the fitted lines guide the eye only.")
+    lines.append("Shear color indicates sign, not failure severity.")
+    lines.append("")
+    lines.append(r"\section*{Stress along the span}")
+    lines.append(figs.get("stress_along_span", ""))
+    lines.append("")
+    lines.append(r"Bending stress is shown at a representative station in each face/core layer;")
+    lines.append("the marker position is a grid-corner recovery, averaged through width. The")
+    lines.append("full-beam span coordinate is used for both full and half models. The first")
+    lines.append("predicted failure marker is shown where available.")
+    lines.append("")
+    lines.append(r"\section*{Convergence}")
+    n_steps = s.get("n_steps", "—")
+    assembly = _fmt(s.get("assembly_time_s"), 3)
+    solve = _fmt(s.get("solve_time_s"), 3)
+    lines.append(f"{n_steps} load steps, assembly {assembly} s, solve {solve} s.")
+    lines.append("")
+    lines.append(r"\end{document}")
+
+    return "\n".join(lines)
+
+
+def _build_latex_tabular(header: List[str], rows: List[List[str]],
+                         spec: str) -> str:
+    """Produce a LaTeX ``tabular`` environment from header/rows and a column spec."""
+    ncol = len(header)
+    cells = [_esc(str(h)) for h in header]
+    body_cells = []
+    for r in rows:
+        row_cells = [_esc(str(c)) for c in r]
+        body_cells.append(row_cells)
+
+    col_format = spec.ljust(ncol, "l")  # ensure exactly ncol spec chars
+
+    lines = [r"\begin{tabular}{" + col_format + "}"]
+    # header row
+    lines.append("    \\toprule")
+    lines.append(" & ".join(cells) + r" \\")
+    lines.append("    \\midrule")
+    # data rows
+    for row_cells in body_cells:
+        row_str = " & ".join(row_cells)
+        lines.append(f"    {row_str} \\\\")
+    lines.append(r"    \\bottomrule")
+    lines.append(r"\end{tabular}")
+
+    return "\n".join(lines)
+
+
 _KPI_PREFIXES = (
     "max force",
     "max deflection",
@@ -284,10 +504,11 @@ def _failure_rows(
     summary: Dict[str, Any], units: Optional[UnitSystem] = None
 ) -> Tuple[List[str], List[List[str]]]:
     units = units or DEFAULT_SYSTEM
+    sym_stress = units.tex_symbol(STRESS)
     header = [
         "layer", "role", "material", "criterion", "max value", "limit",
         "hotspot x/y/z", "unit",
-        "material stress [11,22,33,23,13,12]", "unit",
+        f"material stress [{sym_stress}11,{sym_stress}22,{sym_stress}33,{sym_stress}23,{sym_stress}13,{sym_stress}12]", "unit",
     ]
     limit = tex("1.0")
     hotspot_unit = _unit_cell(LENGTH, units)
@@ -337,12 +558,18 @@ def _failure_rows(
 # --------------------------------------------------------------------------
 
 
-def _md_table(header: List[str], rows: List[List[str]]) -> str:
-    """A Markdown table with padded columns.
+def _md_table(
+    header: List[str], rows: List[List[str]], numeric_cols: Optional[set] = None
+) -> str:
+    """A Markdown table with padded columns and optional alignment.
+
+    Columns whose index appears in ``numeric_cols`` are right-aligned
+    (``| ---: |`` in the separator); all other columns stay left-aligned
+    (``| --- |``).  This gives readable numeric columns while preserving
+    maximum renderer compatibility.
 
     The padding is whitespace only, so both the raw source and the
-    rendered page read as a table; the separator stays plain ``| --- |``
-    for maximum renderer compatibility.
+    rendered page read as a table.
     """
     body = [[str(c) for c in r] for r in rows]
     widths = [
@@ -355,7 +582,13 @@ def _md_table(header: List[str], rows: List[List[str]]) -> str:
             str(c).ljust(widths[i]) for i, c in enumerate(cells)
         ) + " |"
 
-    out = [line(header), "|" + "|".join(["---"] * len(header)) + "|"]
+    if numeric_cols is not None:
+        sep_parts = [
+            ":--" if i in numeric_cols else "--" for i in range(len(header))
+        ]
+    else:
+        sep_parts = ["---"] * len(header)
+    out = [line(header), "|" + "|".join(sep_parts) + "|"]
     out.extend(line(r) for r in body)
     return "\n".join(out)
 
@@ -376,15 +609,11 @@ def build_markdown(results) -> str:
     cfg = results.cfg
     s = results.summary
     u = cfg.unit_system
-    layup_header, layup_rows = _layup_rows(cfg)
-    model_header, model_rows = _model_rows(cfg, s)
+    layup_header, layup_rows = _layup_rows(cfg, u)
+    model_header, model_rows = _model_rows(cfg, s, u)
     global_header, global_rows = _global_rows(s, u)
 
-    glance = " · ".join(
-        f"{label} {value}"
-        + ("" if str(unit) == "—" else f" {unit}")
-        for label, value, unit in _kpi_rows(s, u)
-    )
+    glance_md = _kpi_table(s, u)
 
     lines = [
         f"# Three-Point Bending Report — {cfg.name}",
@@ -397,19 +626,19 @@ def build_markdown(results) -> str:
         f"force {u.force}). Every value sits in its own column with the "
         "unit in the column beside it.",
         "",
-        f"**At a glance:** {glance}",
+        f"**At a glance:**\n{glance_md}",
         "",
         "## Layup / stackup",
         "",
-        _md_table(layup_header, layup_rows),
+        _md_table(layup_header, layup_rows, numeric_cols={3, 6}),
         "",
         "## Model",
         "",
-        _md_table(model_header, model_rows),
+        _md_table(model_header, model_rows, numeric_cols={1}),
         "",
         "## Global results",
         "",
-        _md_table(global_header, global_rows),
+        _md_table(global_header, global_rows, numeric_cols={1}),
         "",
         "## Failure indices",
         "",
@@ -534,8 +763,8 @@ def build_html(results, include_span_profile: bool = True) -> str:
     cfg = results.cfg
     s = results.summary
     u = cfg.unit_system
-    layup_header, layup_rows = _layup_rows(cfg)
-    model_header, model_rows = _model_rows(cfg, s)
+    layup_header, layup_rows = _layup_rows(cfg, u)
+    model_header, model_rows = _model_rows(cfg, s, u)
     global_header, global_rows = _global_rows(s, u)
     f_header, f_rows = _failure_rows(s, u)
 
@@ -767,7 +996,7 @@ def build_pdf(results, pdf_path: str) -> str:
         lam_ax = fig.add_axes([0.06, 0.62, 0.88, 0.27])
         fig_laminate_stackup(cfg, ax=lam_ax)
 
-        layup_header, layup_rows = _layup_rows(cfg)
+        layup_header, layup_rows = _layup_rows(cfg, u)
         bottom = _draw_table(fig, layup_header, layup_rows,
                              title="Layup / stackup", top=0.56,
                              numeric={3, 5, 6})
