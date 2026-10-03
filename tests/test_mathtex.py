@@ -177,7 +177,7 @@ class TestReportsShareTheSameMath:
         rows = re.findall(r'<tr class="failure">(.*?)</tr>', html, flags=re.S)
         assert len(rows) == 1
         assert rows[0].startswith("<td>layer_0</td>")
-        assert rows[0].count("<td>") == 8
+        assert rows[0].count("<td") == 10
         assert rows[0].endswith("</td>")
 
     def test_html_is_self_contained_without_plot_files(self):
