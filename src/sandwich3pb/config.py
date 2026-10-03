@@ -136,6 +136,13 @@ class SolverSpec:
     rtol: float = 1.0e-8
     max_newton_iterations: int = 30
     relative_indentation_steps: Optional[List[float]] = None  # optional overrides
+    # SciPy ``permc_spec`` for the single tangent factorization (see
+    # sandwich3pb.solver._ContactTangentSolver). None keeps SuperLU's default
+    # ordering. "MMD_AT_PLUS_A" cuts fill by ~36% and the factorization plus
+    # the |C| x |C| extraction by ~35% at elements_x = 40, at the cost of a
+    # different elimination order: results then agree to ~1e-10 relative
+    # instead of bitwise. Opt in only if that trade is wanted.
+    factorization_ordering: Optional[str] = None
 
 
 @dataclass

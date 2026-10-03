@@ -36,7 +36,7 @@ Boundary conditions are applied by dof selection on the SciPy matrix:
   * half models: ux = 0 on the symmetry plane x = 0, uy = 0 elsewhere.
 
 The remaining rigid modes (x translation, and z before the supports
-engage) are stabilized with weak ground springs (stiffness 1e-6 x the
+engage) are stabilized with weak ground springs (stiffness 1e-9 x the
 mean diagonal of the free stiffness block) so the Newton tangent is
 nonsingular at every iteration. The springs are ~6 orders of magnitude
 below the contact stiffness and do not measurably affect results; they
@@ -72,6 +72,34 @@ from .postprocess import (
     failure_indices,
     recover_nodal_stress,
 )
+
+
+def _import_fe():
+    """Import the whole optional FEniCSx stack; return nothing.
+
+    FEniCSx is imported lazily so the package stays usable without it (see the
+    note in geometry.py). The FE path needs several of
+    those lazy imports spread over _build_fe_model and
+    geometry.build_dolfinx_mesh; doing them all in one place lets
+    ``ThreePointBendingSolver.__init__`` time the load (MPI_Init plus ~1.3 s
+    of module loading on a warm filesystem cache) separately from assembly.
+    Keep this list a superset of the lazy imports on the FE path, or the
+    reported ``import_time`` understates the real cost.
+    """
+    import basix              # noqa: F401
+    import basix.ufl          # noqa: F401
+    import dolfinx            # noqa: F401
+    import dolfinx.fem        # noqa: F401
+    import dolfinx.mesh       # noqa: F401
+    import ufl                # noqa: F401
+    from mpi4py import MPI    # noqa: F401
+
+
+# FFCx quadrature degree used for the stiffness form (see
+# ThreePointBendingSolver._stiffness_form). 4 points per direction is the
+# cheapest rule that is exact for this integrand; tests/test_quadrature.py
+# re-assembles at a high degree and fails if this ever stops being enough.
+_QUADRATURE_DEGREE = 4
 
 
 # --------------------------------------------------------------------------
@@ -163,19 +191,28 @@ class ThreePointBendingSolver:
         )
         self.point_map: Optional[np.ndarray] = None
 
+        # The FEniCSx stack is imported lazily (it is an optional dependency,
+        # see the note in geometry.py), and paying for it inside the assembly
+        # window charged MPI_Init + ~1.3 s of module loading to "assembly".
+        # Warm it here instead, so assembly_time below measures assembly work
+        # and import_time reports the one-off load.
+        t_import = time.perf_counter()
+        _import_fe()
+        self.import_time = time.perf_counter() - t_import
+
         t0 = time.perf_counter()
         self._build_fe_model()
         self.assembly_time = time.perf_counter() - t0
         if self.verbose:
             print(
                 f"[sandwich3pb] model built: {self.n_nodes} nodes, "
-                f"{self.n_dofs} dofs, assembly {self.assembly_time:.1f} s"
+                f"{self.n_dofs} dofs, assembly {self.assembly_time:.1f} s "
+                f"(+{self.import_time:.1f} s first FEniCSx import)"
             )
 
     # -- model construction ---------------------------------------------------
     def _build_fe_model(self) -> None:
         import dolfinx.fem as fem
-        import ufl
 
         cfg = self.cfg
         mesh, cell_tags, facet_tags, cell_input_ids = \
@@ -233,9 +270,18 @@ class ThreePointBendingSolver:
             self.mesh_data.x[self.mesh_data.cell_conn[:, 4], 2]
             - self.mesh_data.x[self.mesh_data.cell_conn[:, 0], 2],
         ))
+        # 1-based layer index per cell; cached because stress recovery reads
+        # it at every converged step.
+        layer_tags = np.asarray(self.mesh_data.cell_tags, dtype=int)
+        self._cell_tags_int = layer_tags
+        # Cells per stackup layer, in one pass: a stable sort by tag groups
+        # them, so the per-layer index lists come out of one argsort plus one
+        # searchsorted instead of a full tag comparison per layer.
+        order = np.argsort(layer_tags, kind="stable")
+        bounds = np.searchsorted(layer_tags[order],
+                                 np.arange(1, len(cfg.stackup) + 2))
         self._stress_layer_cell_ids = [
-            np.flatnonzero(np.asarray(self.mesh_data.cell_tags) == i + 1)
-            for i in range(len(self.cfg.stackup))
+            order[bounds[i]:bounds[i + 1]] for i in range(len(cfg.stackup))
         ]
         self.n_nodes = int(n_grid)
         self.n_dofs = int(self.V.dofmap.index_map.size_local * bs)
@@ -246,32 +292,10 @@ class ThreePointBendingSolver:
             mat = cfg.materials[layer.material]
             self.quads.append(localized_quad_form(mat, layer.fibre_orientation))
 
-        # ---- bilinear form, layer by layer -----------------------------------
-        u = ufl.TrialFunction(self.V)
-        v = ufl.TestFunction(self.V)
-
-        def voigt_strain(t):
-            return ufl.as_vector(
-                [t[0, 0], t[1, 1], t[2, 2], 2 * t[1, 2], 2 * t[0, 2], 2 * t[0, 1]]
-            )
-
-        def voigt_stress(C, t):
-            s = C * voigt_strain(t)
-            return ufl.as_tensor(
-                [[s[0], s[5], s[4]], [s[5], s[1], s[3]], [s[4], s[3], s[2]]]
-            )
-
-        def eps(w):
-            return ufl.sym(ufl.grad(w))
-
-        dx = ufl.Measure("dx", domain=mesh, subdomain_data=cell_tags)
-        a = 0
-        for i, quad in enumerate(self.quads):
-            C = ufl.as_matrix(quad.C.tolist())
-            a = a + ufl.inner(voigt_stress(C, eps(u)), eps(v)) * dx(i + 1)
-
         # ---- assemble K once (no BC objects; BCs by dof selection) -----------
-        K = _assemble_bilinear(fem.form(a))
+        K = _assemble_bilinear(
+            fem.form(self._stiffness_form(mesh, cell_tags, _QUADRATURE_DEGREE))
+        )
         self.K = K.tocsr()
         self.free_dofs, self.fixed_dofs = self._boundary_dofs()
         K_ff = self.K[self.free_dofs][:, self.free_dofs].tocsc()
@@ -285,7 +309,10 @@ class ThreePointBendingSolver:
         # of the contact reactions (1e-6 keeps ~5% of P, 1e-9 < 0.01%).
         g2f = -np.ones(self.n_dofs, dtype=np.int64)
         g2f[self.free_dofs] = np.arange(self.free_dofs.size)
-        eps = 1.0e-9 * float(np.abs(K_ff.diagonal()).mean())
+        # One scan of the free-block diagonal serves both the springs and the
+        # auto-penalty below (reading the diagonal is an O(nnz) pass).
+        mean_diag = float(np.abs(K_ff.diagonal()).mean())
+        eps = 1.0e-9 * mean_diag
         springs = np.zeros(self.free_dofs.size)
         for component in (0, 2):  # ux, uz
             rows = g2f[self.point_map[:, component]]
@@ -300,8 +327,7 @@ class ThreePointBendingSolver:
         # read self.contact.penalty.
         if cfg.contact.penalty < 0:
             self.contact.penalty = self._auto_penalty(
-                float(np.abs(K_ff.diagonal()).mean()),
-                cfg.contact.penalty_scale,
+                mean_diag, cfg.contact.penalty_scale
             )
 
         # The Newton tangent is K_ff plus a *diagonal* contact term living
@@ -313,7 +339,70 @@ class ThreePointBendingSolver:
             self._contact_dofs(),
             self._full_contact_diagonal(),
             verbose=self.verbose,
+            permc_spec=cfg.solver.factorization_ordering,
         )
+
+    def _stiffness_form(self, mesh, cell_tags, quadrature_degree: int):
+        """Layer-wise bilinear form for the global stiffness, as a UFL form.
+
+        Split out of :meth:`_build_fe_model` so tests can re-assemble the same
+        form at a different ``quadrature_degree`` (which is what makes the
+        pinned degree in ``_QUADRATURE_DEGREE`` verifiable rather than
+        trusted).
+        """
+        import ufl
+
+        u = ufl.TrialFunction(self.V)
+        v = ufl.TestFunction(self.V)
+
+        def voigt_strain(t):
+            return ufl.as_vector(
+                [t[0, 0], t[1, 1], t[2, 2], 2 * t[1, 2], 2 * t[0, 2], 2 * t[0, 1]]
+            )
+
+        def voigt_stress(C, t):
+            """Voigt stress of ``C`` acting on strain ``t``.
+
+            Stays in Voigt form: ``t`` enters through ``voigt_strain`` and
+            the result is contracted with the test function's Voigt strain
+            below. Expanding both back into 3x3 tensors only to let
+            ``ufl.inner`` contract them again is pure overhead for FFCx --
+            three of the nine stored components are duplicates -- and
+            assembling the form that way measured ~1.4x slower here
+            (elements_x = 20/40/80: 268/470/902 ms -> 181/338/665 ms) for
+            the same matrix, so the Voigt vectors are contracted directly.
+            """
+            return C * voigt_strain(t)
+
+        def eps(w):
+            return ufl.sym(ufl.grad(w))
+
+        # The quadrature degree is pinned rather than left to FFCx's default
+        # ("highest degree present in the integrand"), which for Q2
+        # displacement on a trilinear hex8 geometry is degree 6 = 7x7x7 = 343
+        # points per cell. The integrand
+        # dot(C voigt(eps(u)), voigt(eps(v))) is only degree 5 -- grad is
+        # linear in the Q2 coefficients and constant in x -- so a
+        # 4-point-per-direction rule (5x5x5 = 125 points, exact through
+        # degree 7) is exact and ~1.7x cheaper to integrate:
+        # elements_x = 40, 430 ms -> 250 ms, with
+        # max|K - K_default| / max|K_default| = 4e-15.
+        #
+        # That exactness holds only because the geometry map is affine
+        # (trilinear) within each cell and C is constant within each cell.
+        # A curved (quadratic) geometry map, or a graded/smeared material
+        # interpolated across a cell, raises the integrand degree and would
+        # under-integrate silently -- tests/test_quadrature.py re-assembles at
+        # a high degree and fails in that case, so if either is introduced,
+        # raise _QUADRATURE_DEGREE with it.
+        dx = ufl.Measure("dx", domain=mesh, subdomain_data=cell_tags,
+                         metadata={"quadrature_degree": quadrature_degree})
+        a = 0
+        for i, quad in enumerate(self.quads):
+            C = ufl.as_matrix(quad.C.tolist())
+            a = a + ufl.dot(voigt_stress(C, eps(u)), voigt_strain(eps(v))) \
+                * dx(i + 1)
+        return a
 
     def _auto_penalty(self, mean_diag: float, scale: float) -> float:
         """Penalty stiffness derived from the mesh, in N/mm^3.
@@ -435,7 +524,7 @@ class ThreePointBendingSolver:
                 )
         solve_time = time.perf_counter() - t0
 
-        cell_layer = np.asarray(self.mesh_data.cell_tags, dtype=int)  # 1-based
+        cell_layer = self._cell_tags_int  # 1-based
         return Solution(
             cfg=cfg,
             mesh_data=self.mesh_data,
@@ -511,7 +600,7 @@ class ThreePointBendingSolver:
             # not full stress or displacement fields, to locate predicted onset.
             stress, counts = recover_nodal_stress(
                 self.mesh_data, u, self.node2dof,
-                np.asarray(self.mesh_data.cell_tags, dtype=int), self.quads,
+                self._cell_tags_int, self.quads,
                 fe_points=self.fe_points, point_map=self.point_map,
                 element_order=self.element_order,
                 cell_fe_points=self.cell_fe_points,
@@ -687,10 +776,22 @@ class _ContactTangentSolver:
     cap the one-off extraction outweighs the savings and a plain
     per-iteration factorization is used instead. Both branches are the same
     exact algebra, so the choice never changes the answer.
+
+    ``permc_spec`` is the SuperLU fill-reducing ordering of that one
+    factorization. It defaults to SuperLU's own choice; the caller may
+    override it (``SolverSpec.factorization_ordering``) because
+    ``"MMD_AT_PLUS_A"`` is markedly cheaper here -- it orders by ``A + A^T``
+    rather than by ``A^T`` alone, which fits a symmetric positive-definite
+    stiffness matrix, and measured ~36% less fill and ~35% less time in the
+    factorization plus the ``|C| x |C|`` extraction at elements_x = 40
+    (1.63 s -> 1.06 s). It changes only the elimination order, so the answer
+    moves by roundoff (~1e-10 relative on the reported force) but is no
+    longer bitwise reproducible run to run.
     """
 
     def __init__(self, K, contact_dofs: np.ndarray, d_all: np.ndarray,
-                 verbose: bool = False, max_cached_dofs: int = 4000):
+                 verbose: bool = False, max_cached_dofs: int = 4000,
+                 permc_spec: Optional[str] = None):
         self.K = K.tocsc()
         self.contact_dofs = np.asarray(contact_dofs, dtype=np.intp)
         self.contact_dofs.sort()
@@ -699,18 +800,24 @@ class _ContactTangentSolver:
         self._use_cache = 0 < self.m <= max_cached_dofs
         self.n_factorizations = 1
         self.n_solves = 0
+        self._permc_spec = permc_spec
 
         # Full contact stiffness on C, as a length-n diagonal.
         d_full = np.zeros(self.n)
         d_full[self.contact_dofs] = d_all
         self._d_full = d_full
+        # d_all is the |C| slice of that diagonal; keep the slice as its own
+        # array so solve() never re-gathers it out of the length-n vector.
+        self._d_C = d_full[self.contact_dofs]
         # Well-conditioned operator that is actually factorized.
         self._A = (self.K + diags(d_full)).tocsc()
-        self._lu = splu(self._A)
+        self._lu = splu(self._A, permc_spec=self._permc_spec)
 
         self._S: Optional[np.ndarray] = None
         if self._use_cache:
-            # S = Z[C, C]: solve A X = E_C with |C| right-hand sides.
+            # S = Z[C, C]: solve A X = E_C with |C| right-hand sides, in one
+            # multi-rhs call (a column-at-a-time loop and a transposed solve
+            # both measured slower, and neither changes the result).
             rhs = np.zeros((self.n, self.m))
             rhs[self.contact_dofs, np.arange(self.m)] = 1.0
             self._S = np.ascontiguousarray(self._lu.solve(rhs)[self.contact_dofs])
@@ -728,11 +835,12 @@ class _ContactTangentSolver:
         if not self._use_cache:
             # Direct: refactorize. Correct for any d_free, and the only
             # option when the contact set is too large to cache.
-            return splu(self.K + diags(d_free)).solve(rhs)
+            return splu(self.K + diags(d_free),
+                      permc_spec=self._permc_spec).solve(rhs)
 
         y = self._lu.solve(rhs)
         # delta = d_all - d, restricted to C (>= 0 wherever a point opened).
-        delta = self._d_full[self.contact_dofs] - d_free[self.contact_dofs]
+        delta = self._d_C - d_free[self.contact_dofs]
         if not np.any(delta):
             return y  # every contact point active: A^-1 b is already exact
 

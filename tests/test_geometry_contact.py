@@ -86,6 +86,46 @@ def test_all_surface_facets_tagged():
     assert total == 2 * nx * nw
 
 
+@pytest.mark.parametrize("half_model", [False, True])
+def test_dolfinx_facet_tags_match_input(half_model):
+    """dolfinx facet tags reproduce mesh_data.facet_tags exactly.
+
+    build_dolfinx_mesh aligns the input tags with dolfinx's own (permuted,
+    deduplicated) facet numbering by matching vertex sets through
+    ``mesh.geometry.input_global_indices``. Comparing that indirection is
+    easy to get wrong in a way that raises nothing: the lookup simply finds
+    no match, every tag stays 0, and the caller only notices if it reads the
+    array. So the histograms are compared directly here, and cell tags /
+    cell_input_ids are checked to be unaffected by the facet pass.
+    """
+    pytest.importorskip("dolfinx")
+    from sandwich3pb.geometry import build_dolfinx_mesh
+
+    cfg = make_config()
+    cfg.mesh = cfg.mesh.__class__(
+        elements_x=12, elements_w=cfg.mesh.elements_w,
+        elements_per_layer=cfg.mesh.elements_per_layer,
+        element_order=cfg.mesh.element_order,
+    )
+    cfg.half_model = half_model
+    md = build_mesh_data(cfg)
+    mesh, cell_tags, facet_tags, cell_input_ids = build_dolfinx_mesh(md)
+
+    # no tagged facet is invented, and none is missed: the tagged count is
+    # exactly the number of tagged input facets; the rest are interior
+    # facets, which legitimately carry no tag
+    tagged = np.bincount(np.asarray(facet_tags.values))[1:]
+    assert tagged.tolist() == np.bincount(np.asarray(md.facet_tags))[1:].tolist()
+    assert tagged.sum() == md.facet_tags.size
+    # the facet pass must not disturb the (already working) cell branch
+    assert np.array_equal(np.asarray(cell_tags.values),
+                          np.asarray(md.cell_tags)[cell_input_ids])
+    assert (cell_input_ids >= 0).all()
+    assert sorted(cell_input_ids.tolist()) == list(range(md.cells.shape[0]))
+    assert mesh.topology.index_map(mesh.topology.dim - 1).size_local == \
+        np.asarray(facet_tags.values).size
+
+
 def test_gap_signs_undeformed():
     cfg = make_config()
     md = build_mesh_data(cfg)

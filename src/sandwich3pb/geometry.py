@@ -390,6 +390,45 @@ def build_mesh_data(cfg: Config) -> MeshData:
     )
 
 
+def _sorted_vertex_ids(conn, num_entities: int) -> np.ndarray:
+    """``(num_entities, width)`` vertex-id matrix, sorted within each row.
+
+    ``conn`` is a dolfinx adjacency list (ragged by construction). Short
+    rows are padded with ``-1``, which is never a valid vertex id and sorts
+    first, so two rows compare exactly like the sorted tuples they stand for.
+    The result is the array form of ``tuple(sorted(links(f)))`` for every
+    entity ``f``.
+    """
+    offsets = np.asarray(conn.offsets, dtype=np.int64)
+    widths = np.diff(offsets)
+    total = int(widths.sum())
+    rows = np.repeat(np.arange(num_entities, dtype=np.int64), widths)
+    cols = np.arange(total, dtype=np.int64) - np.repeat(offsets[:-1], widths)
+    out = np.full((num_entities, int(widths.max())), -1, dtype=np.int64)
+    out[rows, cols] = np.asarray(conn.array, dtype=np.int64)
+    out.sort(axis=1)
+    return out
+
+
+def _match_vertex_sets(query: np.ndarray, table: np.ndarray) -> np.ndarray:
+    """Row of ``table`` that holds each row of ``query``'s vertex set (-1 if none).
+
+    ``query`` and ``table`` are the sorted-vertex-id matrices produced by
+    :func:`_sorted_vertex_ids` (or ``np.sort(..., axis=1)`` of the input
+    connectivity). Both sides are deduplicated through one ``np.unique`` over
+    the stacked arrays, which reproduces the ``dict`` lookup this replaced:
+    on a duplicated vertex set the *last* row wins, exactly as repeated
+    assignment into the same dict key did.
+    """
+    keys, inverse = np.unique(
+        np.vstack([table, query]), axis=0, return_inverse=True)
+    inverse = np.asarray(inverse).ravel()
+    n_table = table.shape[0]
+    row_of_key = np.full(keys.shape[0], -1, dtype=np.int64)
+    row_of_key[inverse[:n_table]] = np.arange(n_table, dtype=np.int64)
+    return row_of_key[inverse[n_table:]]
+
+
 def build_dolfinx_mesh(mesh_data: MeshData):
     """Create a dolfinx Mesh with cell and facet tags from MeshData.
 
@@ -428,39 +467,54 @@ def build_dolfinx_mesh(mesh_data: MeshData):
 
     # Build facet tag array aligned with dolfinx facet ordering by matching
     # vertex sets (stable topology API, no version-dependent helpers).
+    # The matching is done on whole (entity, sorted vertex id) arrays -- see
+    # _sorted_vertex_ids / _match_vertex_sets -- which is the dict-of-sorted-
+    # tuples lookup written out in NumPy: one sort instead of a Python loop
+    # with a tuple build and a dict probe per facet and per cell.
+    # The entity -> vertex connectivity reports dolfinx's *internal* vertex
+    # ids, while mesh_data.facet_conn holds *input* node ids, so both sides
+    # go through the input global indices (exactly as the cell branch below
+    # must). Skipping that indirection silently matched nothing and left all
+    # facet tags at 0.
+    igi = np.asarray(mesh.geometry.input_global_indices, dtype=np.int64)
     mesh.topology.create_connectivity(fdim, 0)
     facet_vertex_conn = mesh.topology.connectivity(fdim, 0)
 
-    def key(nodes) -> Tuple[int, ...]:
-        return tuple(sorted(int(v) for v in nodes))
-
-    tag_by_key: Dict[Tuple[int, ...], int] = {}
-    for nodes, tag in zip(mesh_data.facet_conn, mesh_data.facet_tags):
-        tag_by_key[key(nodes)] = int(tag)
-
+    facet_rows = _match_vertex_sets(
+        np.sort(igi[_sorted_vertex_ids(facet_vertex_conn, num_facets_local)],
+                axis=1),
+        np.sort(np.asarray(mesh_data.facet_conn, dtype=np.int64), axis=1),
+    )
     facet_tag_values = np.zeros(num_facets_local, dtype=np.int32)
-    for f in range(num_facets_local):
-        k = key(facet_vertex_conn.links(f))
-        facet_tag_values[f] = tag_by_key.get(k, 0)
+    matched = facet_rows >= 0
+    facet_tag_values[matched] = np.asarray(mesh_data.facet_tags)[
+        facet_rows[matched]]
+    # Not "if any facet is untagged": an untagged boundary facet legitimately
+    # has no entry in mesh_data.facet_conn, so the only meaningful check is
+    # that no *input* facet failed to find its dolfinx counterpart.
+    n_input_facets = int(np.asarray(mesh_data.facet_conn).shape[0])
+    n_input_matched = int(np.unique(facet_rows[matched]).size)
+    if n_input_matched != n_input_facets:
+        raise RuntimeError(
+            f"{n_input_facets - n_input_matched} of {n_input_facets} input "
+            "facets could not be matched to the dolfinx mesh"
+        )
 
     # Cell tags: dolfinx may permute cells, so match each dolfinx cell to
     # the input cell by its (sorted) node set via the input global indices.
-    igi = np.asarray(mesh.geometry.input_global_indices)
     mesh.topology.create_connectivity(tdim, 0)
     cell_vertex_conn = mesh.topology.connectivity(tdim, 0)
-    tag_by_node_set: Dict[Tuple[int, ...], int] = {}
-    input_id_by_node_set: Dict[Tuple[int, ...], int] = {}
-    for row, (nodes, tag) in enumerate(
-            zip(mesh_data.cells, mesh_data.cell_tags)):
-        k = key(nodes)
-        tag_by_node_set[k] = int(tag)
-        input_id_by_node_set[k] = row
+    cell_rows = _match_vertex_sets(
+        np.sort(igi[_sorted_vertex_ids(cell_vertex_conn,
+                                       num_cells_local_total)], axis=1),
+        np.sort(np.asarray(mesh_data.cells, dtype=np.int64), axis=1),
+    )
     cell_tag_values = np.zeros(num_cells_local_total, dtype=np.int32)
     cell_input_ids = np.full(num_cells_local_total, -1, dtype=np.int64)
-    for c in range(num_cells_local_total):
-        nodes = tuple(sorted(int(igi[v]) for v in cell_vertex_conn.links(c)))
-        cell_tag_values[c] = tag_by_node_set.get(nodes, 0)
-        cell_input_ids[c] = input_id_by_node_set.get(nodes, -1)
+    input_cell_tags = np.asarray(mesh_data.cell_tags)
+    matched = cell_rows >= 0
+    cell_tag_values[matched] = input_cell_tags[cell_rows[matched]]
+    cell_input_ids[matched] = cell_rows[matched]
     if (cell_input_ids < 0).any():
         raise RuntimeError("some dolfinx cells could not be matched to "
                            "the input mesh data")
