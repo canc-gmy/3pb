@@ -41,6 +41,9 @@ class FakeResults:
             "support_reaction_total_N": 1200.5,
             "force_balance_residual": 1e-12,
             "max_contact_penetration_mm": 4e-4,
+            "peak_contact_penetration_mm": 6e-4,
+            "n_failed_steps": 0,
+            "peak_newton_iterations": 5,
             "max_tsai_wu_faces": 0.12,
             "max_core_shear_ratio": 0.35,
             "max_core_crushing_ratio": 0.20,
@@ -50,6 +53,7 @@ class FakeResults:
             "n_dofs": 2997,
             "assembly_time_s": 1.0,
             "solve_time_s": 2.0,
+            "failure_onset": None,
             "failure_by_layer": {
                 "layer_0": {"role": "face", "material": "glass_epoxy",
                             "orientation_deg": 0.0, "max_tsai_wu": 0.12},
@@ -152,7 +156,23 @@ def test_failure_rows_cover_all_layers():
     view = FakeResults(cfg, ".")
     header, rows = _failure_rows(view.summary)
     assert len(rows) == 4  # 2 faces + 2 core criteria
+    assert len(header) == 8
     assert any("Tsai-Wu" in r[3] for r in rows)
+
+
+def test_failure_onset_is_highlighted_in_markdown_and_global_table():
+    cfg = make_config()
+    view = FakeResults(cfg, ".")
+    view.summary["failure_onset"] = {
+        "step": 3, "travel_mm": 0.6, "force_N": 900.0,
+        "deflection_mm": 0.5, "criterion_keys": ["layer_1:shear"],
+    }
+    md = build_markdown(view)
+    assert "Predicted first failure — step 3" in md
+    assert "layer_1:shear" in md
+    rows = _global_rows(view.summary, cfg.unit_system)
+    onset_row = next(row for row in rows if row[0] == "predicted first failure")
+    assert "step 3" in onset_row[1]
 
 
 def test_markdown_renders_all_sections(tmp_path):

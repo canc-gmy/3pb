@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import datetime
 import os
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -33,7 +34,6 @@ from .units import (
     FORCE,
     GRADIENT,
     LENGTH,
-    NONE,
     PENALTY,
     RIGIDITY,
     STRESS,
@@ -48,6 +48,21 @@ from .units import (
 # --------------------------------------------------------------------------
 # table builders (shared by md/html/pdf)
 # --------------------------------------------------------------------------
+
+
+def _numeric_value(value: Any) -> Optional[float]:
+    """Read plain or scientific-notation numeric TeX cells."""
+    text = str(value).strip().strip("$")
+    match = re.fullmatch(
+        r"([+-]?(?:\d+(?:\.\d*)?|\.\d+))"
+        r"(?:\\times 10\^\{([+-]?\d+)\})?",
+        text,
+    )
+    if match is None:
+        return None
+    number = float(match.group(1))
+    exponent = int(match.group(2) or 0)
+    return number * 10.0**exponent
 
 
 def _fmt(v: Any, digits: int = 4) -> str:
@@ -69,13 +84,6 @@ def _fmt(v: Any, digits: int = 4) -> str:
     if not np.isfinite(f):
         return "—"
     return f"{f:.{digits}g}"
-
-
-def _units_of(cfg_or_units) -> UnitSystem:
-    """Accept a :class:`Config` or a :class:`UnitSystem` interchangeably."""
-    if isinstance(cfg_or_units, UnitSystem):
-        return cfg_or_units
-    return cfg_or_units.unit_system
 
 
 def _u(dim: str, units: UnitSystem) -> str:
@@ -155,7 +163,7 @@ def _global_rows(summary: Dict[str, Any],
     def n(key: str, digits: int = 4) -> str:
         return fmt_tex_num(summary.get(key), digits)
 
-    return [
+    rows = [
         ["max force " + tex(r"P_{\max}"), q("max_force_N", FORCE)],
         ["deflection at max force " + tex("w"),
          q("deflection_at_max_force_mm", LENGTH)],
@@ -176,14 +184,50 @@ def _global_rows(summary: Dict[str, Any],
         ["support reactions (final)",
          fmt_tex_list(summary.get("support_reactions_N"), u, FORCE)],
         ["force-balance residual", n("force_balance_residual", 3)],
-        ["max contact penetration",
+        ["final-step contact penetration",
          q("max_contact_penetration_mm", LENGTH, 3)],
+        ["peak contact penetration",
+         q("peak_contact_penetration_mm", LENGTH, 3)],
         ["all steps converged", fmt_tex_num(summary.get("all_steps_converged"))],
+        ["failed load steps", fmt_tex_num(summary.get("n_failed_steps"))],
+        ["peak Newton iterations", fmt_tex_num(summary.get("peak_newton_iterations"))],
+        ["predicted first failure", ""],
     ]
+    onset = summary.get("failure_onset")
+    if onset:
+        criteria = ", ".join(onset.get("criterion_keys", [])) or "criterion limit"
+        rows[-1][1] = (
+            f"step {onset['step']}; "
+            f"travel {fmt_tex_qty(onset['travel_mm'], u, LENGTH)}; "
+            f"force {fmt_tex_qty(onset['force_N'], u, FORCE)}; "
+            f"deflection {fmt_tex_qty(onset['deflection_mm'], u, LENGTH)}; "
+            f"{criteria}"
+        )
+    else:
+        rows[-1][1] = "no criterion reached 1.0 in simulated steps"
+    return rows
 
 
-def _failure_rows(summary: Dict[str, Any]) -> Tuple[List[str], List[List[str]]]:
-    header = ["layer", "role", "material", "criterion", "max value", "limit"]
+def _fmt_location(location, units: UnitSystem) -> str:
+    if location is None:
+        return "—"
+    return ", ".join(fmt_tex_qty(value, units, LENGTH) for value in location)
+
+
+def _fmt_stress_components(values, units: UnitSystem) -> str:
+    if values is None:
+        return "—"
+    return ", ".join(fmt_tex_qty(value, units, STRESS) for value in values)
+
+
+def _failure_rows(
+    summary: Dict[str, Any], units: Optional[UnitSystem] = None
+) -> Tuple[List[str], List[List[str]]]:
+    units = units or DEFAULT_SYSTEM
+    header = [
+        "layer", "role", "material", "criterion", "max value", "limit",
+        "hotspot x/y/z", "material stress [11,22,33,23,13,12]",
+    ]
     limit = tex("1.0")
     rows: List[List[str]] = []
     by_layer = summary.get("failure_by_layer", {}) or {}
@@ -194,17 +238,25 @@ def _failure_rows(summary: Dict[str, Any]) -> Tuple[List[str], List[List[str]]]:
                 "Tsai-Wu index " + tex(r"\mathrm{TW}"),
                 fmt_tex_num(d.get("max_tsai_wu"), 4),
                 limit,
+                _fmt_location(d.get("max_tsai_wu_location_mm"), units),
+                _fmt_stress_components(
+                    d.get("max_tsai_wu_stress_material_MPa"), units
+                ),
             ])
         else:
             rows.append([
                 key, "core", d.get("material", "—"),
                 "shear utilisation " + tex(r"\frac{|\tau_{xz}|}{\tau_c}"),
                 fmt_tex_num(d.get("max_shear_ratio"), 4), limit,
+                _fmt_location(d.get("max_shear_location_mm"), units),
+                fmt_tex_qty(d.get("max_shear_stress_MPa"), units, STRESS),
             ])
             rows.append([
                 key, "core", d.get("material", "—"),
                 "crushing utilisation " + tex(r"\frac{\sigma_{zz}}{\sigma_c}"),
                 fmt_tex_num(d.get("max_crushing_ratio"), 4), limit,
+                _fmt_location(d.get("max_crushing_location_mm"), units),
+                fmt_tex_qty(d.get("max_crushing_stress_MPa"), units, STRESS),
             ])
     return header, rows
 
@@ -220,6 +272,18 @@ def _md_table(header: List[str], rows: List[List[str]]) -> str:
     for r in rows:
         out.append("| " + " | ".join(str(c) for c in r) + " |")
     return "\n".join(out)
+
+
+def _md_img(results, name: str, alt: str) -> str:
+    """Markdown image link, or an explicit note when the figure is absent.
+
+    A case without a mid-span profile (or one whose figures failed to
+    render) would otherwise leave a broken image in the report; the HTML
+    build already degrades the same way.
+    """
+    if os.path.exists(os.path.join(_plots_dir(results), f"{name}.svg")):
+        return f"![{alt}](plots/{name}.svg)"
+    return f"_missing figure: {name}.svg_"
 
 
 def build_markdown(results) -> str:
@@ -252,44 +316,57 @@ def build_markdown(results) -> str:
         "",
         "## Failure indices",
         "",
-        "Values above $1.0$ predict failure by the respective criterion.",
+        "Existing criteria are engineering onset indicators, not a progressive-damage model. Values at or above $1.0$ indicate predicted failure; onset is resolved to the configured load-step interval. The table reports maxima from recovered grid-corner stresses per layer; hotspot coordinates are x/y/z, and the listed six stress components are in material axes in [11, 22, 33, 23, 13, 12] order.",
         "",
     ]
-    f_header, f_rows = _failure_rows(s)
+    f_header, f_rows = _failure_rows(s, u)
     if f_rows:
         lines += [_md_table(f_header, f_rows), ""]
     else:
         lines += ["_no failure data available_", ""]
 
+    onset = s.get("failure_onset")
+    if onset:
+        criteria = ", ".join(onset.get("criterion_keys", [])) or "criterion limit"
+        lines += [
+            f"**Predicted first failure — step {onset['step']} ({criteria})**: "
+            f"travel {fmt_tex_qty(onset['travel_mm'], u, LENGTH)}, "
+            f"force {fmt_tex_qty(onset['force_N'], u, FORCE)}, "
+            f"deflection {fmt_tex_qty(onset['deflection_mm'], u, LENGTH)}. "
+            "This is an onset estimate at the configured load-step "
+            "resolution; no progressive damage is modeled.",
+            "",
+        ]
+    else:
+        lines += [
+            "**No predicted failure:** none of the existing criteria reached "
+            "1.0 in the simulated steps.",
+            "",
+        ]
+
     lines += [
         "## Laminate cross-section (true thickness)",
         "",
-        "![laminate](plots/laminate_stackup.svg)",
+        _md_img(results, "laminate_stackup", "laminate"),
         "",
         "Through-thickness axis at true scale; the beam axis is compressed "
         "for readability.",
         "",
         "## Load–deflection",
         "",
-        "![load-deflection](plots/load_deflection.svg)",
+        _md_img(results, "load_deflection", "load-deflection"),
         "",
         "## Mid-span through-thickness profile",
         "",
-        "![profile](plots/thickness_profile.svg)",
+        _md_img(results, "thickness_profile", "profile"),
         "",
-        "Each layer is drawn at true thickness and shaded by the stress it "
-        "carries — red in compression ($/sigma_{xx}<0$ in the plotted "
-        "sign convention), blue in tension. The dashed line is a "
-        "least-squares fit of the samples within each layer; open circles "
-        "are the raw recovery points.",
+        "The plot shows the grid-corner recovered stress averaged across beam width, separately within each material layer; stress can jump at bonded interfaces. Red indicates positive/tensile stress and blue negative/compressive stress. Markers are recovery samples; the fitted lines guide the eye only. Shear color indicates sign, not failure severity.",
         "",
         "## Stress along the span",
         "",
-        "![span](plots/stress_along_span.svg)",
+        _md_img(results, "stress_along_span", "span"),
         "",
-        "$/sigma_{xx}$ is sampled at the mid-thickness of each layer and "
-        "peaks under the load roller; $/tau_{xz}$ peaks at the supports "
-        "where the shear transfer happens.",
+        "Bending stress is shown at a representative station in each face/core layer; the marker position is a grid-corner recovery, averaged through width. The full-beam span coordinate is used for both full and half models. The first predicted failure marker is shown where available.",
         "",
         "## Convergence",
         "",
@@ -325,6 +402,9 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   .meta {{ color: #666; font-size: .9em; }}
   .ok {{ color: #1a7f37; font-weight: 600; }}
   .bad {{ color: #b42318; font-weight: 600; }}
+  .onset {{ background: #fff2f0; border-left: 5px solid #b42318;
+            padding: .75em 1em; margin: .8em 0; }}
+  .failure {{ color: #b42318; font-weight: 700; }}
 </style>
 </head>
 <body>
@@ -334,23 +414,31 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 """
 
 
-def build_html(results) -> str:
+def build_html(results, include_span_profile: bool = True) -> str:
     cfg = results.cfg
     s = results.summary
     u = cfg.unit_system
     layup_header, layup_rows = _layup_rows(cfg)
-    f_header, f_rows = _failure_rows(s)
+    f_header, f_rows = _failure_rows(s, u)
 
     def cell(value: Any) -> str:
         """Typeset any ``$...$`` in a cell before it reaches the browser."""
         return render_html(str(value))
 
-    def table(header, rows):
+    def table(header, rows, highlight_failure=False):
         head = "".join(f"<th>{cell(h)}</th>" for h in header)
-        body = "".join(
-            "<tr>" + "".join(f"<td>{cell(c)}</td>" for c in r) + "</tr>"
-            for r in rows
-        )
+        rendered_rows = []
+        for row in rows:
+            value = (
+                _numeric_value(row[4])
+                if highlight_failure and len(row) > 4 else None
+            )
+            row_class = (
+                ' class="failure"' if value is not None and value >= 1.0 else ""
+            )
+            cells = "".join(f"<td>{cell(item)}</td>" for item in row)
+            rendered_rows.append(f"<tr{row_class}>{cells}</tr>")
+        body = "".join(rendered_rows)
         return f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
 
     def img(path):
@@ -396,55 +484,77 @@ def build_html(results) -> str:
             "<h2>Global results</h2>",
             table(["quantity", "value"], _global_rows(s, u)),
             "<h2>Failure indices</h2>",
-            "<p>Values above 1.0 predict failure by the respective "
-            "criterion.</p>",
-            table(f_header, f_rows) if f_rows else "<p><em>no data</em></p>",
+            "<p>Existing criteria are engineering onset indicators, not a "
+            "progressive-damage model. Values at or above 1.0 indicate "
+            "predicted failure; onset is resolved to the configured step "
+            "interval. The table reports per-layer maxima from recovered "
+            "grid-corner stresses; hotspot coordinates are x/y/z and the "
+            "six material-axis stress components are in [11, 22, 33, 23, "
+            "13, 12] order.</p>",
+            table(f_header, f_rows, highlight_failure=True)
+            if f_rows else "<p><em>no data</em></p>",
             "<h2>Load–deflection</h2>",
             img(os.path.join(plots_dir, "load_deflection.svg")),
             "<h2>Mid-span through-thickness profile</h2>",
             img(os.path.join(plots_dir, "thickness_profile.svg")),
             cell(
-                "<p>Each layer is drawn at true thickness and shaded by the "
-                "stress it carries — red in compression "
-                r"($\sigma_{xx} \leq 0$), blue in tension. The dashed line is "
-                "a least-squares fit of the samples within each layer; open "
-                "circles are the raw recovery points.</p>"
+                "<p>Stress is recovered at grid corners and averaged across "
+                "beam width, separately by material layer. Stress may jump "
+                "at bonded interfaces. Red is positive/tensile and blue is "
+                "negative/compressive; shear color shows sign, not severity. "
+                "Lines guide the eye; markers are recovered values.</p>"
             ),
+        ]
+    )
+
+    # Stress-along-span image is embedded when its figure was generated;
+    # if not, the missing asset is made explicit rather than mislabeling a
+    # load-deflection plot as a stress distribution.
+    span_section: List[str] = []
+    if include_span_profile:
+        span_section = [
             "<h2>Stress along the span</h2>",
             img(os.path.join(plots_dir, "stress_along_span.svg")),
             cell(
-                "<p>$\\sigma_{xx}$ is sampled at the mid-thickness of each "
-                "layer and peaks under the load roller; $\\tau_{xz}$ peaks "
-                "at the supports where the shear transfer happens.</p>"
+                "<p>Stress samples are averaged through width at the selected "
+                "layer station. Span x uses full-beam coordinates for both "
+                "full and half models. The first predicted-failure marker "
+                "is shown where available.</p>"
             ),
-            f"<h2>Convergence</h2><p>{conv_html} — "
-            f"{s.get('n_steps', '—')} load steps, assembly "
-            f"{_fmt(s.get('assembly_time_s'), 3)} s, solve "
-            f"{_fmt(s.get('solve_time_s'), 3)} s.</p>",
         ]
-    )
+
+    if span_section:
+        body += "\n" + "\n".join(span_section)
+
+    onset = s.get("failure_onset")
+    if onset:
+        criteria = ", ".join(onset.get("criterion_keys", [])) or "criterion limit"
+        onset_html = (
+            f'<div class="onset"><strong>Predicted first failure — '
+            f"step {onset['step']}</strong>: {criteria}; travel "
+            f"{cell(fmt_tex_qty(onset['travel_mm'], u, LENGTH))}, force "
+            f"{cell(fmt_tex_qty(onset['force_N'], u, FORCE))}, deflection "
+            f"{cell(fmt_tex_qty(onset['deflection_mm'], u, LENGTH))}. "
+            "Onset is an estimate at the configured load-step resolution; "
+            "no progressive damage is modeled.</div>"
+        )
+    else:
+        onset_html = (
+            '<div class="onset">No existing failure criterion reached 1.0 '
+            "in the simulated steps.</div>"
+        )
+    body += "\n" + onset_html + "\n"
+    body += f"<h2>Convergence</h2><p>{conv_html} — "
+    body += f"{s.get('n_steps', '—')} load steps, assembly "
+    body += f"{_fmt(s.get('assembly_time_s'), 3)} s, solve "
+    body += f"{_fmt(s.get('solve_time_s'), 3)} s.</p>"
+
     return _HTML_TEMPLATE.format(title=f"3PB Report — {cfg.name}", body=body)
 
 
 def _plots_dir(results) -> str:
     # plots live in <out_dir>/plots; report.py receives out_dir at call time
     return getattr(results, "_plots_dir", "plots")
-
-
-def _fig_paths(results, name: str) -> Dict[str, str]:
-    """Paths of the saved vector/raster variants of one figure.
-
-    ``save_all_figures`` writes <name>.(pdf|svg|png) into the plots
-    directory; a missing variant resolves to the PNG mirror, and if no
-    file exists at all the PNG path is returned anyway (callers handle a
-    missing file gracefully).
-    """
-    d = _plots_dir(results)
-    return {
-        "pdf": os.path.join(d, f"{name}.pdf"),
-        "svg": os.path.join(d, f"{name}.svg"),
-        "png": os.path.join(d, f"{name}.png"),
-    }
 
 
 # --------------------------------------------------------------------------
@@ -467,6 +577,7 @@ def build_pdf(results, pdf_path: str) -> str:
 
     cfg = results.cfg
     s = results.summary
+    u = cfg.unit_system
 
     with PdfPages(pdf_path) as pdf:
         # ---- page 1: title + true-scale laminate + layup table ----------
@@ -499,7 +610,7 @@ def build_pdf(results, pdf_path: str) -> str:
         _draw_table(fig, ["quantity", "value"], global_rows,
                     title="Global results", top=0.90)
 
-        f_header, f_rows = _failure_rows(s)
+        f_header, f_rows = _failure_rows(s, u)
         if f_rows:
             _draw_table(fig, f_header, f_rows,
                         title="Failure indices (limit = 1.0)", top=0.40)
@@ -589,7 +700,8 @@ def write_report(results, out_dir: str) -> Dict[str, str]:
 
     paths: Dict[str, str] = {}
     try:
-        for name, variants in save_all_figures(results, plots_dir).items():
+        generated = save_all_figures(results, plots_dir)
+        for name, variants in generated.items():
             for ext, path in variants.items():
                 paths[f"fig_{name}_{ext}"] = path
     except Exception as exc:

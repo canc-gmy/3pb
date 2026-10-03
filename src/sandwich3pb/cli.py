@@ -23,9 +23,23 @@ def _config_from_summary(data: dict):
     )
 
     raw = data["config"]
+    # the stored dict is written in the case file's units (see
+    # config_to_yaml_dict); scale it back to internal units exactly as
+    # load_config does for a YAML case file, and remember the system.
+    # Case dirs written before the unit system existed declare nothing
+    # and were stored in internal mm/MPa -- MM_N_MPA is their identity.
+    from .units import MM_N_MPA, get_units, scale_raw_config
+
+    unit_system = get_units(
+        str(raw.get("units") or data.get("units") or MM_N_MPA.name)
+        .strip()
+        .lower()
+    )
+    raw = scale_raw_config(raw, unit_system)
     return Config(
         name=raw.get("name", "case"),
         output_dir=raw.get("output_dir", "results"),
+        units=unit_system.name,
         geometry=GeometrySpec(**raw["geometry"]),
         materials={k: MaterialSpec(**v) for k, v in raw["materials"].items()},
         stackup=[LayerSpec(**lay) for lay in raw["stackup"]],
@@ -50,22 +64,37 @@ def _load_case_dir(case_dir: str):
     """Load summary.json + history CSV from a case output directory."""
     import csv
 
-    from .io import _plot_load_deflection  # noqa: F401  (shared code path)
+    from .units import FORCE, LENGTH, STRESS
 
     with open(os.path.join(case_dir, "summary.json")) as f:
         data = json.load(f)
     cfg = _config_from_summary(data)
+    units = cfg.unit_system
 
     history = []
     hist_path = os.path.join(case_dir, "load_deflection.csv")
     if os.path.exists(hist_path):
         with open(hist_path) as f:
             for row in csv.DictReader(f):
+                serialized_failure = row.get("failure_by_layer", "")
+                try:
+                    failure_by_layer = json.loads(serialized_failure or "{}")
+                except json.JSONDecodeError:
+                    failure_by_layer = {}
                 history.append(
                     {
                         "step": int(row["step"]),
-                        "force_N": float(row["force_N"]),
-                        "deflection_mm": float(row["deflection_mm"]),
+                        "travel_mm": units.to_internal(
+                            LENGTH, float(row[f"travel_{units.length}"])
+                        ),
+                        "force_N": units.to_internal(
+                            FORCE, float(row[f"force_{units.force}"])
+                        ),
+                        "deflection_mm": units.to_internal(
+                            LENGTH, float(row[f"deflection_{units.length}"])
+                        ),
+                        "converged": row["converged"].lower() == "true",
+                        "failure_by_layer": failure_by_layer,
                     }
                 )
 
@@ -75,12 +104,24 @@ def _load_case_dir(case_dir: str):
     if os.path.exists(prof_path):
         import numpy as np
 
+        # columns carry the case's unit suffix and values are in the
+        # case's units; restore internal (mm/MPa) for the figures
         cols = {"z": [], "sigma_xx": [], "tau_xz": [], "layer": []}
         with open(prof_path) as f:
             for row in csv.DictReader(f):
-                cols["z"].append(float(row["z_mm"]))
-                cols["sigma_xx"].append(float(row["sigma_xx_MPa"]))
-                cols["tau_xz"].append(float(row["tau_xz_MPa"]))
+                cols["z"].append(
+                    units.to_internal(LENGTH, float(row[f"z_{units.length}"]))
+                )
+                cols["sigma_xx"].append(
+                    units.to_internal(
+                        STRESS, float(row[f"sigma_xx_{units.stress}"])
+                    )
+                )
+                cols["tau_xz"].append(
+                    units.to_internal(
+                        STRESS, float(row[f"tau_xz_{units.stress}"])
+                    )
+                )
                 cols["layer"].append(int(row["layer_index"]))
         profile = {k: np.array(v) for k, v in cols.items()}
         profile["x"] = np.zeros_like(profile["z"])
@@ -94,6 +135,38 @@ def _load_case_dir(case_dir: str):
     view.summary = data
     view.history = history
     view.profile = profile
+    view.span_profile = {}
+    span_path = os.path.join(case_dir, "profile_span.csv")
+    if os.path.exists(span_path):
+        import numpy as np
+
+        grouped = {}
+        with open(span_path) as f:
+            for row in csv.DictReader(f):
+                layer = int(row["layer_index"])
+                station = grouped.setdefault(
+                    layer,
+                    {"label": row["station_material"], "x": [],
+                     "sigma_xx": [], "tau_xz": []},
+                )
+                station["x"].append(
+                    units.to_internal(LENGTH, float(row[f"x_{units.length}"]))
+                )
+                station["sigma_xx"].append(
+                    units.to_internal(STRESS, float(row[f"sigma_xx_{units.stress}"]))
+                )
+                station["tau_xz"].append(
+                    units.to_internal(STRESS, float(row[f"tau_xz_{units.stress}"]))
+                )
+        layer_ids = sorted(grouped)
+        view.span_profile = {
+            "x": np.asarray(grouped[layer_ids[0]]["x"]) if layer_ids else None,
+            "x_station": [np.asarray(grouped[i]["x"]) for i in layer_ids],
+            "station_layer": layer_ids,
+            "station_label": [grouped[i]["label"] for i in layer_ids],
+            "sigma_xx": [np.asarray(grouped[i]["sigma_xx"]) for i in layer_ids],
+            "tau_xz": [np.asarray(grouped[i]["tau_xz"]) for i in layer_ids],
+        }
     return view
 
 

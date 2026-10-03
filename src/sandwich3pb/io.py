@@ -34,7 +34,8 @@ def write_case_outputs(results, out_dir: str) -> Dict[str, str]:
     with open(hist_path, "w") as f:
         f.write(
             f"step,travel_{L},force_{F},deflection_{L},support_forces_{F},"
-            f"max_violation_{L},newton_iterations,al_iterations,converged\n"
+            f"max_violation_{L},newton_iterations,al_iterations,converged,"
+            "failure_by_layer\n"
         )
         for row in results.history:
             reactions = ", ".join(
@@ -47,7 +48,8 @@ def write_case_outputs(results, out_dir: str) -> Dict[str, str]:
                 f"\"{reactions}\","
                 f"{out(LENGTH, row['max_violation_mm']):.3e},"
                 f"{row['newton_iterations']},"
-                f"{row['al_iterations']},{row['converged']}\n"
+                f"{row['al_iterations']},{row['converged']},"
+                f"\"{json.dumps(row.get('failure_by_layer', {}), separators=(',', ':'))}\"\n"
             )
     paths["load_deflection_csv"] = hist_path
 
@@ -133,12 +135,18 @@ def write_case_outputs(results, out_dir: str) -> Dict[str, str]:
     try:
         plot_dir = os.path.join(out_dir, "plots")
         os.makedirs(plot_dir, exist_ok=True)
-        paths["plot_load_deflection"] = _plot_load_deflection(
-            results, plot_dir
-        )
-        paths["plot_thickness_profile"] = _plot_thickness_profile(
-            results, plot_dir
-        )
+        from .figures import save_all_figures
+
+        generated = save_all_figures(results, plot_dir)
+        for name, variants in generated.items():
+            for ext, path in variants.items():
+                paths[f"plot_{name}_{ext}"] = path
+        for name in ("thickness_profile", "stress_along_span"):
+            if name not in generated:
+                for ext in ("pdf", "svg", "png"):
+                    stale_path = os.path.join(plot_dir, f"{name}.{ext}")
+                    if os.path.exists(stale_path):
+                        os.remove(stale_path)
     except Exception as exc:  # matplotlib backend issues must not kill a run
         paths["plot_error"] = str(exc)
 

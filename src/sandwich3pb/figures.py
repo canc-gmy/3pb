@@ -332,6 +332,23 @@ def fig_load_deflection(results, ax=None):
         fig = ax.figure
     if deflection.size:
         ax.plot(deflection, force, "o-", ms=4, lw=1.4, label="FE")
+        onset = results.summary.get("failure_onset")
+        if onset:
+            onset_defl = cfg.unit_system.from_internal(
+                LENGTH, onset["deflection_mm"]
+            )
+            onset_force = cfg.unit_system.from_internal(
+                FORCE, onset["force_N"]
+            )
+            ax.plot(onset_defl, onset_force, marker="*", ms=13,
+                    color="crimson", linestyle="none", zorder=6,
+                    label=f"predicted first failure (step {onset['step']})")
+            ax.annotate(
+                "predicted onset",
+                (onset_defl, onset_force),
+                xytext=(7, 9), textcoords="offset points",
+                fontsize=7, color="crimson",
+            )
     if np.isfinite(grad) and deflection.size > 1:
         from .units import GRADIENT, fmt_num
 
@@ -346,7 +363,9 @@ def fig_load_deflection(results, ax=None):
     ax.tick_params(labelsize=7.5)
     ax.set_title(f"Load–deflection — {results.cfg.name}", fontsize=10)
     _apply_style(fig)
-    ax.legend(fontsize=8)
+    handles, labels = ax.get_legend_handles_labels()
+    if handles:
+        ax.legend(handles, labels, fontsize=8)
     if created_here:
         fig.tight_layout()
     return fig
@@ -438,7 +457,9 @@ def fig_thickness_profile(results, axs=None):
                    fontsize=8.5)
     ax1.set_ylim(bounds[0], bounds[-1])
     _layer_labels(ax1, cfg, bounds, colors)
-    ax1.legend(fontsize=7, loc="lower left", framealpha=0.85)
+    handles, labels = ax1.get_legend_handles_labels()
+    if handles:
+        ax1.legend(handles, labels, fontsize=7, loc="lower left", framealpha=0.85)
 
     if created_here:
         cax = fig.add_axes([0.905, 0.12, 0.016, 0.76])
@@ -460,9 +481,9 @@ def fig_stress_along_span(results, axs=None):
 
     The companion to the thickness profile: three-point bending drives
     bending stress from mid-span and shear stress from the supports, so
-    the same recovered stress is sampled here at the mid-thickness of the
-    bottom face, the core and the top face. The load roller and the
-    supports are marked so the peaks can be read against the test setup.
+    the recovered stress is sampled at the nearest mesh station to each
+    selected layer midpoint. The load roller and supports are marked for
+    reference.
     """
     import matplotlib
 
@@ -473,10 +494,33 @@ def fig_stress_along_span(results, axs=None):
     span = getattr(results, "span_profile", None) or {}
     x = span.get("x")
     if x is None or len(span.get("sigma_xx", [])) == 0:
-        return fig_load_deflection(results)  # nothing sampled: stay usable
+        if axs is not None:
+            raise ValueError("cannot draw span stress: no span-profile samples")
+        fig, ax = plt.subplots(figsize=(8.2, 3.0), dpi=_DPI_PNG)
+        ax.text(0.5, 0.5, "No span-stress samples available",
+                ha="center", va="center", transform=ax.transAxes)
+        ax.set_axis_off()
+        return fig
 
     layer_colors = _layer_colors(cfg)
     stations = list(zip(span["station_layer"], span["station_label"]))
+    onset = results.summary.get("failure_onset")
+    onset_location = None
+    onset_layer = None
+    if onset:
+        # Mark the location identified by the criterion that first crossed 1.
+        for criterion_key in onset.get("criterion_keys", []):
+            layer_key, criterion = criterion_key.split(":", 1)
+            data = onset.get("failure_by_layer", {}).get(layer_key, {})
+            location_key = {
+                "tsai_wu": "max_tsai_wu_location_mm",
+                "shear": "max_shear_location_mm",
+                "crushing": "max_crushing_location_mm",
+            }.get(criterion)
+            onset_location = data.get(location_key) if location_key else None
+            if onset_location is not None:
+                onset_layer = int(layer_key.rsplit("_", 1)[1])
+                break
     # each station carries its own x, in case a layer lost a node
     xs = span.get("x_station") or [x] * len(stations)
 
@@ -498,11 +542,25 @@ def fig_stress_along_span(results, axs=None):
                     _display(cfg, STRESS, np.asarray(values, float)),
                     lw=1.4, color=layer_colors.get(int(layer), "0.3"),
                     label=f"{label} — layer {int(layer) + 1}")
+        if onset_location is not None and onset_layer in span.get("station_layer", []):
+            station_i = span["station_layer"].index(onset_layer)
+            sample_values = span[key][station_i]
+            sample_x = _display(cfg, LENGTH, np.asarray(xs[station_i], dtype=float))
+            index = int(np.argmin(np.abs(sample_x -
+                                         _display(cfg, LENGTH, onset_location[0]))))
+            ax.plot(
+                sample_x[index],
+                _display(cfg, STRESS, np.asarray(sample_values, float)[index]),
+                marker="*", ms=10, color="crimson", linestyle="none",
+                label="first predicted failure location",
+            )
         ax.axhline(0.0, color="0.35", linewidth=0.7)
         ax.set_ylabel(symbol + _unit_suffix(cfg, STRESS), fontsize=8.5)
         ax.set_title(title, fontsize=9)
         ax.tick_params(labelsize=7.5)
-        ax.legend(fontsize=7.5, loc="best")
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend(handles, labels, fontsize=7.5, loc="best")
 
     # test setup markers: load roller at mid-span, supports at +-span/2
     half = cfg.half_model
@@ -567,7 +625,8 @@ def save_all_figures(results, plot_dir: str) -> Dict[str, Dict[str, str]]:
             fig_thickness_profile(results),
             os.path.join(plot_dir, "thickness_profile"),
         )
-    if getattr(results, "span_profile", None):
+    span = getattr(results, "span_profile", None) or {}
+    if span.get("x") is not None and len(span.get("sigma_xx", [])):
         saved["stress_along_span"] = save_figure(
             fig_stress_along_span(results),
             os.path.join(plot_dir, "stress_along_span"),

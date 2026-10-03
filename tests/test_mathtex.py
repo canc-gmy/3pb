@@ -158,6 +158,28 @@ class TestReportsShareTheSameMath:
         assert "<script" not in html
         assert "<link" not in html
 
+    def test_html_marks_predicted_onset(self):
+        view = FakeResults(make_config(), ".")
+        view.summary["failure_onset"] = {
+            "step": 2, "travel_mm": 0.4, "force_N": 800.0,
+            "deflection_mm": 0.3, "criterion_keys": ["layer_0:tsai_wu"],
+        }
+        html = build_html(view)
+        assert "Predicted first failure — step 2" in html
+        assert "no progressive damage is modeled" in html
+        assert 'class="onset"' in html
+
+    def test_html_failure_rows_are_complete_and_threshold_highlighted(self):
+        view = FakeResults(make_config(), ".")
+        view.summary["failure_by_layer"]["layer_0"]["max_tsai_wu"] = 1.2e7
+        view.summary["failure_by_layer"]["layer_2"]["max_tsai_wu"] = 0.9
+        html = build_html(view)
+        rows = re.findall(r'<tr class="failure">(.*?)</tr>', html, flags=re.S)
+        assert len(rows) == 1
+        assert rows[0].startswith("<td>layer_0</td>")
+        assert rows[0].count("<td>") == 8
+        assert rows[0].endswith("</td>")
+
     def test_html_is_self_contained_without_plot_files(self):
         """Missing figures degrade to a note, not an exception."""
         html = build_html(FakeResults(make_config(), "/nonexistent-plots"))
