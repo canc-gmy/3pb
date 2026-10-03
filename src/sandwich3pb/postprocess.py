@@ -94,6 +94,19 @@ def _q2_shape_derivs() -> np.ndarray:
 _Q2_DN = _q2_shape_derivs()
 
 
+#: Which Voigt strain components a spatial direction contributes to, as
+#: ``(displacement component, Voigt index)`` pairs in Voigt order
+#: ``[11, 22, 33, 23, 13, 12]``. Row ``a`` is the direction; e.g. ``e_xx``
+#: is ``du_x/dx`` (direction 0, component 0) while ``g_xz`` collects
+#: ``du_z/dx`` and ``du_x/dz``, which arrive from direction 0 and direction 2
+#: respectively and are summed here.
+_VOIGT_FEEDS = (
+    ((0, 0), (2, 4), (1, 5)),   # direction x -> xx, gxz, gxy
+    ((1, 1), (2, 3), (0, 5)),   # direction y -> yy, gyz, gxy
+    ((2, 2), (1, 3), (0, 4)),   # direction z -> zz, gyz, gxz
+)
+
+
 def build_cell_fe_point_map(mesh_data, fe_points) -> np.ndarray:
     """Return each cell's 27 Q2 point ids in tensor-product basis order."""
     X = mesh_data.x[np.asarray(mesh_data.cell_conn)]
@@ -153,25 +166,21 @@ def recover_nodal_stress(
         dN_ref = _DN
         u_cell = u_dofs[node2dof[cells]]              # (nc, 8, 3)
 
-    # B operator rows (Voigt: 11,22,33,23,13,12)
+    # B operator rows (Voigt: 11,22,33,23,13,12).
+    # Batched over every cell *and* every evaluation point: the loop runs
+    # over the three spatial directions rather than the shape functions, and
+    # each contraction covers all cells at once. Same algebra as looping
+    # over evaluation points, with no per-point Python overhead -- this runs
+    # once per converged load step.
     eps = np.zeros((n_cells, 8, 6))
-    for j in range(8):
-        g = dN_ref[j][None, :, :] * inv_jac[:, None, :]
-        e11 = np.einsum("ca,ca->c", g[:, :, 0], u_cell[:, :, 0])
-        e22 = np.einsum("ca,ca->c", g[:, :, 1], u_cell[:, :, 1])
-        e33 = np.einsum("ca,ca->c", g[:, :, 2], u_cell[:, :, 2])
-        g23 = np.einsum("ca,ca->c", g[:, :, 2], u_cell[:, :, 1]) + \
-              np.einsum("ca,ca->c", g[:, :, 1], u_cell[:, :, 2])
-        g13 = np.einsum("ca,ca->c", g[:, :, 2], u_cell[:, :, 0]) + \
-              np.einsum("ca,ca->c", g[:, :, 0], u_cell[:, :, 2])
-        g12 = np.einsum("ca,ca->c", g[:, :, 1], u_cell[:, :, 0]) + \
-              np.einsum("ca,ca->c", g[:, :, 0], u_cell[:, :, 1])
-        eps[:, j, 0] = e11
-        eps[:, j, 1] = e22
-        eps[:, j, 2] = e33
-        eps[:, j, 3] = g23
-        eps[:, j, 4] = g13
-        eps[:, j, 5] = g12
+    u_c = u_cell.transpose(2, 0, 1)          # (3, nc, n_fn)
+    for a, feeds in enumerate(_VOIGT_FEEDS):
+        # shape-function gradient along direction a, per cell and eval point
+        g = dN_ref[:, :, a][None, :, :] * inv_jac[:, a][:, None, None]
+        for k, m in feeds:
+            eps[..., m] += np.einsum(
+                "cji,ci->cj", g, u_c[k], optimize=True
+            )
 
     C_g = np.stack([q.C for q in quads])                # (n_layers, 6, 6)
     layer_of_cell = np.asarray(cell_layer_tags, dtype=np.intp) - 1

@@ -209,28 +209,16 @@ class ThreePointBendingSolver:
         n_blocks = block_coords.shape[0]
         if n_blocks * bs != int(self.V.dofmap.index_map.size_local * bs):
             raise RuntimeError("dof coordinate tabulation is not per block")
-        block_of_coord: Dict[Tuple[float, float, float], int] = {}
-        for block in range(n_blocks):
-            c = tuple(np.round(block_coords[block], 9))
-            if c in block_of_coord:
-                raise RuntimeError("duplicated dof coordinates")
-            block_of_coord[c] = block
-        if len(block_of_coord) != n_fe:
+        if n_blocks != n_fe:
             raise RuntimeError(
                 f"{n_blocks} dof blocks but {n_fe} FE points - element "
                 "order and mesh do not agree"
             )
-        point_map = np.full((n_fe, 3), -1, dtype=np.int64)
-        for pid in range(n_fe):
-            c = tuple(np.round(fe.xyz[pid], 9))
-            block = block_of_coord.get(c)
-            if block is None:
-                raise RuntimeError(
-                    f"FE point {pid} at {fe.xyz[pid]} has no matching dof"
-                )
-            point_map[pid, 0] = block * bs
-            point_map[pid, 1] = block * bs + 1
-            point_map[pid, 2] = block * bs + 2
+        block_of_point = _match_points_to_blocks(fe.xyz, block_coords)
+        point_map = np.empty((n_fe, 3), dtype=np.int64)
+        point_map[:, 0] = block_of_point * bs
+        point_map[:, 1] = block_of_point * bs + 1
+        point_map[:, 2] = block_of_point * bs + 2
         self.node2dof = point_map[:n_grid]
         self.point_map = point_map
         self.cell_fe_points = (
@@ -306,8 +294,84 @@ class ThreePointBendingSolver:
         self.K_ff = (K_ff + diags(springs)).tocsc()
         self._z_free_positions = g2f[self.point_map[:, 2]]
         self._z_valid_positions = self._z_free_positions >= 0
-        # The Newton tangent (K_ff + active contact stiffness) is factored
-        # per iteration inside _newton.
+
+        # A negative configured penalty means "derive it from the mesh".
+        # This must happen before the contact system and the tangent solver
+        # read self.contact.penalty.
+        if cfg.contact.penalty < 0:
+            self.contact.penalty = self._auto_penalty(
+                float(np.abs(K_ff.diagonal()).mean()),
+                cfg.contact.penalty_scale,
+            )
+
+        # The Newton tangent is K_ff plus a *diagonal* contact term living
+        # only on the contact DOFs, so K_ff's factorization is built once
+        # here and reused by every Newton iteration of every load step
+        # (see _ContactTangentSolver).
+        self._tangent = _ContactTangentSolver(
+            self.K_ff,
+            self._contact_dofs(),
+            self._full_contact_diagonal(),
+            verbose=self.verbose,
+        )
+
+    def _auto_penalty(self, mean_diag: float, scale: float) -> float:
+        """Penalty stiffness derived from the mesh, in N/mm^3.
+
+        What matters for contact is the *nodal* stiffness ``k * A`` against
+        the stiffness of the structure it pushes on, not ``k`` on its own --
+        ``k`` carries an inverse-area factor that changes with the mesh
+        refinement. So the scale is applied to ``k * A``:
+
+            k * A = penalty_scale * mean(diag(K_ff))
+
+        which makes ``penalty_scale`` directly readable as "how many times
+        stiffer than the bulk the contact is". It also makes the result
+        independent of ``elements_w``, roller radius and mesh density, so
+        one value works across cases instead of needing retuning.
+        """
+        areas = [
+            pair.point_areas
+            for name in (LOAD, SUPPORT)
+            for pair in self.contact.pairs[name]
+        ]
+        areas = np.concatenate(areas) if areas else np.empty(0)
+        mean_area = float(areas.mean()) if areas.size else 1.0
+        if mean_area <= 0.0:
+            raise ValueError("contact points have zero tributary area")
+        penalty = scale * mean_diag / mean_area
+        if self.verbose:
+            print(
+                f"[sandwich3pb] auto-penalty: {penalty:.4g} N/mm^3 "
+                f"(penalty_scale={scale:g} -> k*A = {scale:g} x "
+                f"mean stiffness {mean_diag:.4g} N/mm; mean contact area "
+                f"{mean_area:.4g} mm^2)"
+            )
+        return penalty
+
+    def _contact_dofs(self) -> np.ndarray:
+        """Free z-dofs that any roller can act on (the contact DOF set C).
+
+        Fixed by the geometry, so it is computed once. ``d_free`` may be
+        nonzero only on these rows, which is what makes the tangent solve
+        cheap.
+        """
+        rows = [self._z_free_positions[pair.point_ids]
+                for name in (LOAD, SUPPORT)
+                for pair in self.contact.pairs[name]]
+        rows = np.concatenate(rows) if rows else np.empty(0, dtype=np.int64)
+        return np.unique(rows[rows >= 0])
+
+    def _full_contact_diagonal(self) -> np.ndarray:
+        """Contact stiffness of *every* contact point, aligned to C.
+
+        This is the well-conditioned reference operator the tangent solver
+        factorizes; see its docstring for why ``K_ff`` alone is unsuitable.
+        """
+        rows = [self.contact.penalty * pair.point_areas
+                for name in (LOAD, SUPPORT)
+                for pair in self.contact.pairs[name]]
+        return np.concatenate(rows) if rows else np.empty(0)
 
     def grid_node_point(self, node_id: int) -> int:
         """FE point id of a grid node (order 1: identity)."""
@@ -532,8 +596,7 @@ class ThreePointBendingSolver:
                 z_free_positions[z_valid],
                 diag_contact[z_valid],
             )
-            T = (self.K_ff + diags(d_free)).tocsc()
-            delta = _solve_tangent(T, -r_free)
+            delta = self._tangent.solve(-r_free, d_free)
             u[self.free_dofs] += delta
             iters = it + 1
 
@@ -545,11 +608,141 @@ class ThreePointBendingSolver:
 # --------------------------------------------------------------------------
 
 
-def _solve_tangent(T, rhs: np.ndarray) -> np.ndarray:
-    """Solve the Newton tangent system (nonsingular thanks to the ground
-    springs on the rigid modes and the touching-inclusive contact
-    activation)."""
-    return splu(T).solve(rhs)
+def _match_points_to_blocks(points: np.ndarray,
+                            blocks: np.ndarray) -> np.ndarray:
+    """Map each FE point to the dof block sitting at the same location.
+
+    ``points`` and ``blocks`` are the two descriptions of the *same* point
+    set (the structured grid vs. dolfinx's permuted dof coordinates), so
+    they can be matched by sorting both on the rounded coordinates and
+    comparing the sorted keys -- O(n log n) inside NumPy, with no Python
+    loop and no per-point dict tuple.
+
+    A dict lookup is kept as a fallback for the (unexpected) case where the
+    sorted keys disagree, so a matching failure degrades to the slow but
+    obvious path instead of silently producing a wrong map.
+    """
+    kp = np.round(np.asarray(points, dtype=float), 9)
+    kb = np.round(np.asarray(blocks, dtype=float), 9)
+
+    op = np.lexsort((kp[:, 0], kp[:, 1], kp[:, 2]))
+    ob = np.lexsort((kb[:, 0], kb[:, 1], kb[:, 2]))
+    if kp.shape == kb.shape and np.array_equal(kp[op], kb[ob]):
+        out = np.empty(kp.shape[0], dtype=np.int64)
+        out[op] = ob
+        return out
+
+    lookup: Dict[Tuple[float, float, float], int] = {}
+    for block in range(kb.shape[0]):
+        key = tuple(kb[block])
+        if key in lookup:
+            raise RuntimeError("duplicated dof coordinates")
+        lookup[key] = block
+    out = np.empty(kp.shape[0], dtype=np.int64)
+    for pid in range(kp.shape[0]):
+        block = lookup.get(tuple(kp[pid]))
+        if block is None:
+            raise RuntimeError(
+                f"FE point {pid} at {points[pid]} has no matching dof"
+            )
+        out[pid] = block
+    return out
+
+
+class _ContactTangentSolver:
+    """Exact solver for the Newton tangent ``(K + diag(d)) x = b``.
+
+    The tangent differs from the constant bulk stiffness ``K`` only by a
+    *diagonal* contact term supported on ``C``, the small geometry-fixed set
+    of contact DOFs. So one matrix is factorized **per run** and every Newton
+    iteration of every load step reuses it, replacing an O(n^1.5)-O(n^2)
+    re-factorization with two triangular solve pairs plus a dense
+    ``|C| x |C|`` solve.
+
+    *What gets factorized.* Not ``K`` itself, but
+
+        A = K + diag(d_all)
+
+    where ``d_all`` is the contact stiffness of **every** contact point
+    (not just the active ones). ``K`` alone is deliberately near-singular --
+    its rigid modes are held only by ~1e-9 ground springs -- so ``K^-1``
+    carries entries ~1e9 and the Woodbury correction below would cancel two
+    huge vectors to produce a small one. Adding the contact stiffness first
+    removes exactly that ill-conditioning. Since the active-set difference
+    is again diagonal on ``C``, the correction stays a Woodbury update and
+    the answer remains that of the *unmodified* ``K + diag(d)``.
+
+    *How the correction is applied.* With ``Z = A^-1``, ``E_C`` the
+    membership matrix of ``C``, ``delta = d_all - d`` (>= 0, supported on
+    ``C``) and ``S = Z[C, C]``, Woodbury in push-through form gives
+
+        (A - E_C diag_C E_C^T)^-1
+            = Z + Z E_C (I - diag_C S)^-1 diag_C E_C^T Z.
+
+    Applied to ``b`` this needs ``Z b`` plus one more solve with a vector
+    supported on ``C``, so the ``|C|``-wide extraction is never repeated per
+    iteration: ``S`` is built once, from ``|C|`` right-hand sides.
+
+    ``|C|`` enters the cost only there, hence ``max_cached_dofs``: above the
+    cap the one-off extraction outweighs the savings and a plain
+    per-iteration factorization is used instead. Both branches are the same
+    exact algebra, so the choice never changes the answer.
+    """
+
+    def __init__(self, K, contact_dofs: np.ndarray, d_all: np.ndarray,
+                 verbose: bool = False, max_cached_dofs: int = 4000):
+        self.K = K.tocsc()
+        self.contact_dofs = np.asarray(contact_dofs, dtype=np.intp)
+        self.contact_dofs.sort()
+        self.n = K.shape[0]
+        self.m = int(self.contact_dofs.size)
+        self._use_cache = 0 < self.m <= max_cached_dofs
+        self.n_factorizations = 1
+        self.n_solves = 0
+
+        # Full contact stiffness on C, as a length-n diagonal.
+        d_full = np.zeros(self.n)
+        d_full[self.contact_dofs] = d_all
+        self._d_full = d_full
+        # Well-conditioned operator that is actually factorized.
+        self._A = (self.K + diags(d_full)).tocsc()
+        self._lu = splu(self._A)
+
+        self._S: Optional[np.ndarray] = None
+        if self._use_cache:
+            # S = Z[C, C]: solve A X = E_C with |C| right-hand sides.
+            rhs = np.zeros((self.n, self.m))
+            rhs[self.contact_dofs, np.arange(self.m)] = 1.0
+            self._S = np.ascontiguousarray(self._lu.solve(rhs)[self.contact_dofs])
+
+        if verbose:
+            kind = (
+                f"cached (1 factorization, |C|={self.m})" if self._use_cache
+                else f"direct (|C|={self.m} over cache cap)"
+            )
+            print(f"[sandwich3pb] tangent solver: {kind}, n={self.n}")
+
+    def solve(self, rhs: np.ndarray, d_free: np.ndarray) -> np.ndarray:
+        """Solve ``(K + diag(d_free)) x = rhs``."""
+        self.n_solves += 1
+        if not self._use_cache:
+            # Direct: refactorize. Correct for any d_free, and the only
+            # option when the contact set is too large to cache.
+            return splu(self.K + diags(d_free)).solve(rhs)
+
+        y = self._lu.solve(rhs)
+        # delta = d_all - d, restricted to C (>= 0 wherever a point opened).
+        delta = self._d_full[self.contact_dofs] - d_free[self.contact_dofs]
+        if not np.any(delta):
+            return y  # every contact point active: A^-1 b is already exact
+
+        # Woodbury correction, confined to C:
+        #   w = (I - diag_C S)^-1 diag_C (Z b)|_C ;   x = y + Z E_C w
+        small = np.eye(self.m) - delta[:, None] * self._S
+        w = np.linalg.solve(small, delta * y[self.contact_dofs])
+        v = np.zeros(self.n)
+        v[self.contact_dofs] = w
+        return y + self._lu.solve(v)
 
 
 def _nearest_node(coords: np.ndarray, x: float, y: float, z: float) -> int:

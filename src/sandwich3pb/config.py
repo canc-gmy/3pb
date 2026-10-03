@@ -102,7 +102,13 @@ class MeshSpec:
 
 @dataclass
 class ContactSpec:
-    penalty: float = 1.0e3          # penalty stiffness (force units factor)
+    # penalty stiffness (N/mm^3 internally). A negative value means
+    # "auto": derive it so that penalty * tributary_area equals
+    # ``penalty_scale`` times the mean diagonal stiffness of the assembled
+    # matrix, i.e. how many times stiffer than the bulk the contact is.
+    # Scale by the area because the penalty carries an inverse-area factor.
+    penalty: float = -1.0
+    penalty_scale: float = 10.0
     roller_radius_load: float = 10.0
     roller_radius_support: float = 5.0
     friction: float = 0.0           # v1: frictionless only
@@ -395,8 +401,16 @@ def validate_config(cfg: Config) -> None:
         if m.elements_per_layer.get(role, 0) < 1:
             errors.append(f"mesh: elements_per_layer['{role}'] must be >= 1")
 
-    if cfg.contact.penalty <= 0:
-        errors.append("contact: penalty must be positive")
+    if cfg.contact.penalty == 0:
+        errors.append(
+            "contact: penalty must be positive, or negative to auto-scale "
+            "it from the assembled stiffness"
+        )
+    if cfg.contact.penalty < 0 and cfg.contact.penalty_scale <= 0:
+        errors.append(
+            "contact: penalty_scale must be positive (it sets the "
+            "auto-scaled contact stiffness relative to the mesh)"
+        )
     if cfg.contact.roller_radius_load <= 0 or cfg.contact.roller_radius_support <= 0:
         errors.append("contact: roller radii must be positive")
     if cfg.contact.friction != 0.0:

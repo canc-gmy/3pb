@@ -79,3 +79,31 @@ def test_yaml_roundtrip(tmp_path):
     assert loaded.total_thickness == pytest.approx(cfg.total_thickness)
     assert loaded.stackup[0].fibre_orientation == 0.0
     assert loaded.materials["pvc_foam"].E == pytest.approx(75.0)
+
+
+def test_penalty_auto_scale_is_accepted_and_zero_is_not():
+    """A negative penalty means "scale from the assembled stiffness".
+
+    Zero is meaningless either way and stays rejected, so a typo cannot
+    silently disable contact enforcement.
+    """
+    cfg = make_config()
+    cfg.contact.penalty = -1.0
+    cfg.contact.penalty_scale = 1.0e6
+    validate_config(cfg)
+
+    cfg.contact.penalty = 0.0
+    with pytest.raises(ValueError, match="penalty"):
+        validate_config(cfg)
+
+
+def test_penalty_scale_must_be_positive_when_auto_scaling():
+    """``penalty_scale`` is only meaningful in the auto regime."""
+    cfg = make_config()
+    cfg.contact.penalty = 1.0e6      # explicit: scale is not consulted
+    cfg.contact.penalty_scale = 0.0
+    validate_config(cfg)
+
+    cfg.contact.penalty = -1.0      # auto: a non-positive scale is a typo
+    with pytest.raises(ValueError, match="penalty_scale"):
+        validate_config(cfg)
