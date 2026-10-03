@@ -156,6 +156,18 @@ class TestContactQuality:
         assert sandwich_results.summary["all_steps_converged"]
 
 
+class TestFailureTracking:
+    def test_converged_steps_retain_layer_failure_indices(self, sandwich_results):
+        """Onset reporting samples existing criteria at each converged step."""
+        for row in sandwich_results.history:
+            if not row["converged"]:
+                assert not row["failure_by_layer"]
+                continue
+            assert set(row["failure_by_layer"]) == {"layer_0", "layer_1", "layer_2"}
+            assert "max_tsai_wu" in row["failure_by_layer"]["layer_0"]
+            assert "max_shear_ratio" in row["failure_by_layer"]["layer_1"]
+
+
 class TestMonotonicity:
     def test_force_monotone_in_travel(self, sandwich_results):
         f = [r["force_N"] for r in sandwich_results.history]

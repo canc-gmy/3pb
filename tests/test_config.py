@@ -47,6 +47,25 @@ def test_unknown_material_rejected():
         validate_config(cfg)
 
 
+def test_solver_controls_must_be_positive():
+    cfg = make_config()
+    cfg.solver.rtol = 0.0
+    with pytest.raises(ValueError, match="rtol must be positive"):
+        validate_config(cfg)
+
+    cfg = make_config()
+    cfg.solver.max_newton_iterations = 0
+    with pytest.raises(ValueError, match="max_newton_iterations"):
+        validate_config(cfg)
+
+
+def test_augmented_lagrangian_controls_must_be_valid():
+    cfg = make_config()
+    cfg.contact.augmented_lagrangian.max_outer = 0
+    with pytest.raises(ValueError, match="max_outer"):
+        validate_config(cfg)
+
+
 def test_yaml_roundtrip(tmp_path):
     import yaml
 

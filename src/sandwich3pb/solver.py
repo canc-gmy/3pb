@@ -67,6 +67,11 @@ from .geometry import (
     surface_patch_fe,
 )
 from .materials import LocalizedQuad, localized_quad_form
+from .postprocess import (
+    build_cell_fe_point_map,
+    failure_indices,
+    recover_nodal_stress,
+)
 
 
 # --------------------------------------------------------------------------
@@ -87,6 +92,7 @@ class StepRecord:
     newton_iterations: int
     al_iterations: int
     converged: bool
+    failure_by_layer: Dict[str, Dict] = field(default_factory=dict)
 
 
 @dataclass
@@ -227,6 +233,22 @@ class ThreePointBendingSolver:
             point_map[pid, 2] = block * bs + 2
         self.node2dof = point_map[:n_grid]
         self.point_map = point_map
+        self.cell_fe_points = (
+            build_cell_fe_point_map(self.mesh_data, fe)
+            if self.element_order == 2 else None
+        )
+        self._stress_cell_sizes = np.column_stack((
+            self.mesh_data.x[self.mesh_data.cell_conn[:, 1], 0]
+            - self.mesh_data.x[self.mesh_data.cell_conn[:, 0], 0],
+            self.mesh_data.x[self.mesh_data.cell_conn[:, 2], 1]
+            - self.mesh_data.x[self.mesh_data.cell_conn[:, 0], 1],
+            self.mesh_data.x[self.mesh_data.cell_conn[:, 4], 2]
+            - self.mesh_data.x[self.mesh_data.cell_conn[:, 0], 2],
+        ))
+        self._stress_layer_cell_ids = [
+            np.flatnonzero(np.asarray(self.mesh_data.cell_tags) == i + 1)
+            for i in range(len(self.cfg.stackup))
+        ]
         self.n_nodes = int(n_grid)
         self.n_dofs = int(self.V.dofmap.index_map.size_local * bs)
 
@@ -282,6 +304,8 @@ class ThreePointBendingSolver:
             valid = rows >= 0
             springs[rows[valid]] = eps
         self.K_ff = (K_ff + diags(springs)).tocsc()
+        self._z_free_positions = g2f[self.point_map[:, 2]]
+        self._z_valid_positions = self._z_free_positions >= 0
         # The Newton tangent (K_ff + active contact stiffness) is factored
         # per iteration inside _newton.
 
@@ -401,6 +425,9 @@ class ThreePointBendingSolver:
                         g, self.contact.penalty, al.update_rate
                     )
 
+        if gaps_final is None:
+            gaps_final = self.contact.gaps_all(u[self.point_map[:, 2]])
+
         forces = self.contact.resultant_forces(gaps_final)
         # half models carry half the load roller (symmetry); scale so all
         # reported forces refer to the full beam
@@ -414,6 +441,23 @@ class ThreePointBendingSolver:
                                  cfg.total_thickness)
         w_mid = -float(u[self.node2dof[mid_node, 2]])
 
+        failure_by_layer: Dict[str, Dict] = {}
+        if converged:
+            # Retain per-layer failure indices at converged load increments,
+            # not full stress or displacement fields, to locate predicted onset.
+            stress, counts = recover_nodal_stress(
+                self.mesh_data, u, self.node2dof,
+                np.asarray(self.mesh_data.cell_tags, dtype=int), self.quads,
+                fe_points=self.fe_points, point_map=self.point_map,
+                element_order=self.element_order,
+                cell_fe_points=self.cell_fe_points,
+                cell_sizes=self._stress_cell_sizes,
+                layer_cell_ids=self._stress_layer_cell_ids,
+            )
+            failure_by_layer = failure_indices(
+                cfg, self.mesh_data, stress, counts, quads=self.quads
+            )
+
         record = StepRecord(
             step=step,
             travel=travel,
@@ -424,6 +468,7 @@ class ThreePointBendingSolver:
             newton_iterations=newton_iters,
             al_iterations=al_iters,
             converged=converged,
+            failure_by_layer=failure_by_layer,
         )
         return record, u
 
@@ -443,8 +488,8 @@ class ThreePointBendingSolver:
         pm = self.point_map
         z_dofs = pm[:, 2]
         fe = self.fe_points
-        g2f = -np.ones(self.n_dofs, dtype=np.int64)
-        g2f[self.free_dofs] = np.arange(self.free_dofs.size)
+        z_free_positions = self._z_free_positions
+        z_valid = self._z_valid_positions
 
         converged = False
         ref_force = 1.0
@@ -474,19 +519,18 @@ class ThreePointBendingSolver:
             r_full = self.K @ u
             r_full[z_dofs] -= forces_z
             r_free = r_full[self.free_dofs]
-            if np.max(np.abs(r_free)) <= cfg.solver.rtol * ref_force:
+            residual = float(np.max(np.abs(r_free)))
+            if residual <= cfg.solver.rtol * ref_force:
                 converged = True
                 iters = it
                 break
 
             d_free = np.zeros(self.free_dofs.size)
             # map nodal contact stiffness onto the free z-dof diagonal
-            z_free_positions = g2f[z_dofs]
-            valid = z_free_positions >= 0
             np.add.at(
                 d_free,
-                z_free_positions[valid],
-                diag_contact[np.where(valid)[0]],
+                z_free_positions[z_valid],
+                diag_contact[z_valid],
             )
             T = (self.K_ff + diags(d_free)).tocsc()
             delta = _solve_tangent(T, -r_free)

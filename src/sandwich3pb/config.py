@@ -406,6 +406,18 @@ def validate_config(cfg: Config) -> None:
         errors.append("loading: max_indentation must be positive")
     if cfg.loading.n_steps < 1:
         errors.append("loading: n_steps must be >= 1")
+    if cfg.solver.rtol <= 0:
+        errors.append("solver: rtol must be positive")
+    if cfg.solver.max_newton_iterations < 1:
+        errors.append("solver: max_newton_iterations must be >= 1")
+    al = cfg.contact.augmented_lagrangian
+    if al.max_outer < 1:
+        errors.append("contact.augmented_lagrangian: max_outer must be >= 1")
+    if al.tol < 0 or al.update_rate < 0:
+        errors.append(
+            "contact.augmented_lagrangian: tol and update_rate must be "
+            "non-negative"
+        )
 
     if errors:
         raise ValueError("Invalid configuration:\n  - " + "\n  - ".join(errors))

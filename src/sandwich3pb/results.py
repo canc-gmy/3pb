@@ -18,6 +18,51 @@ from .postprocess import (
 from .solver import Solution
 
 
+def failure_criterion_values(failure_by_layer: Dict[str, Dict]) -> Dict[str, float]:
+    """Flatten layer maxima into criterion-qualified keys."""
+    values: Dict[str, float] = {}
+    for layer, data in failure_by_layer.items():
+        if data.get("role") == "face":
+            key = f"{layer}:tsai_wu"
+            values[key] = float(data.get("max_tsai_wu", float("nan")))
+        elif data.get("role") == "core":
+            for criterion, field in (
+                ("shear", "max_shear_ratio"),
+                ("crushing", "max_crushing_ratio"),
+            ):
+                key = f"{layer}:{criterion}"
+                values[key] = float(data.get(field, float("nan")))
+    return values
+
+
+def first_failure_onset(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """First converged step with any existing index reaching its limit of 1."""
+    for row in history:
+        if not row.get("converged", False):
+            continue
+        by_layer = row.get("failure_by_layer", {}) or {}
+        criteria = failure_criterion_values(by_layer)
+        crossing = [
+            key for key, value in criteria.items()
+            if np.isfinite(value) and value >= 1.0
+        ]
+        if crossing:
+            return {
+                "step": int(row["step"]),
+                "travel_mm": float(row["travel_mm"]),
+                "force_N": float(row["force_N"]),
+                "deflection_mm": float(row["deflection_mm"]),
+                "criterion_keys": crossing,
+                "criterion_values": {key: criteria[key] for key in crossing},
+                "failure_by_layer": {
+                    layer: by_layer[layer]
+                    for layer in sorted({key.rsplit(":", 1)[0] for key in crossing})
+                    if layer in by_layer
+                },
+            }
+    return None
+
+
 def _stiffness_gradient(force: np.ndarray, deflection: np.ndarray
                         ) -> tuple[float, float, int]:
     """dP/dw by iteratively refitted linear regression.
@@ -95,9 +140,29 @@ class CaseResults:
             solution.node2dof,
             solution.cell_layer_tags,
             solution.solver_ref.quads,
+            fe_points=solution.fe_points,
+            point_map=solution.solver_ref.point_map,
+            element_order=solution.element_order,
+            cell_fe_points=solution.solver_ref.cell_fe_points,
+            cell_sizes=solution.solver_ref._stress_cell_sizes,
+            layer_cell_ids=solution.solver_ref._stress_layer_cell_ids,
         )
-        failure = failure_indices(cfg, solution.mesh_data, stress, counts,
-                                  quads=solution.solver_ref.quads)
+        failure = failure_indices(
+            cfg, solution.mesh_data, stress, counts,
+            quads=solution.solver_ref.quads,
+        )
+        for layer_key, record in (hist[-1].failure_by_layer.items()
+                                  if hist else []):
+            if layer_key not in failure:
+                continue
+            for key in (
+                "max_tsai_wu", "max_shear_ratio", "max_crushing_ratio",
+                "max_tsai_wu_location_mm", "max_shear_location_mm",
+                "max_crushing_location_mm", "max_tsai_wu_stress_material_MPa",
+                "max_shear_stress_MPa", "max_crushing_stress_MPa",
+            ):
+                if key in record:
+                    failure[layer_key][key] = record[key]
         profile = midspan_profile(
             solution.mesh_data, stress, counts, cfg,
             u_z_fe=solution.u_z_fe(),
@@ -105,7 +170,6 @@ class CaseResults:
         )
         span_profile = beam_axis_profile(stress, counts, solution.mesh_data, cfg)
 
-        roles = cfg.resolve_roles()
         face_tw = [
             d["max_tsai_wu"] for d in failure.values() if d["role"] == "face"
         ]
@@ -147,6 +211,9 @@ class CaseResults:
             "support_reaction_total_N": support_total,
             "force_balance_residual": balance_residual,
             "max_contact_penetration_mm": last.max_violation,
+            "peak_contact_penetration_mm": max(
+                (r.max_violation for r in hist), default=0.0
+            ),
             "max_tsai_wu_faces": max(face_tw) if face_tw else None,
             "max_core_shear_ratio": max(core_shear) if core_shear else None,
             "max_core_crushing_ratio": max(core_crush) if core_crush else None,
@@ -158,6 +225,21 @@ class CaseResults:
             "assembly_time_s": solution.assembly_time,
             "solve_time_s": solution.solve_time,
             "failure_by_layer": failure,
+            "failure_onset": first_failure_onset([
+                {
+                    "step": r.step,
+                    "travel_mm": r.travel,
+                    "force_N": r.force_load,
+                    "deflection_mm": r.max_deflection,
+                    "converged": r.converged,
+                    "failure_by_layer": r.failure_by_layer,
+                }
+                for r in hist
+            ]),
+            "n_failed_steps": sum(not r.converged for r in hist),
+            "peak_newton_iterations": max(
+                (r.newton_iterations for r in hist), default=0
+            ),
         }
         return cls(
             cfg=cfg,
@@ -173,6 +255,7 @@ class CaseResults:
                     "newton_iterations": r.newton_iterations,
                     "al_iterations": r.al_iterations,
                     "converged": r.converged,
+                    "failure_by_layer": r.failure_by_layer,
                 }
                 for r in hist
             ],

@@ -185,22 +185,39 @@ class LocalizedQuad:
         """
         one = sig_g.ndim == 1
         sig = np.atleast_2d(sig_g)
-        R = self.R
-        out = np.empty_like(sig)
-        for n in range(sig.shape[0]):
-            s = R.T @ voigt_to_tensor_stress(sig[n]) @ R
-            out[n] = tensor_to_voigt_stress(s)
+        tensors = np.zeros((sig.shape[0], 3, 3), dtype=sig.dtype)
+        tensors[:, 0, 0] = sig[:, 0]
+        tensors[:, 1, 1] = sig[:, 1]
+        tensors[:, 2, 2] = sig[:, 2]
+        tensors[:, 1, 2] = tensors[:, 2, 1] = sig[:, 3]
+        tensors[:, 0, 2] = tensors[:, 2, 0] = sig[:, 4]
+        tensors[:, 0, 1] = tensors[:, 1, 0] = sig[:, 5]
+        rotated = np.einsum("ia,nij,jb->nab", self.R, tensors, self.R,
+                            optimize=True)
+        out = np.column_stack((
+            rotated[:, 0, 0], rotated[:, 1, 1], rotated[:, 2, 2],
+            rotated[:, 1, 2], rotated[:, 0, 2], rotated[:, 0, 1],
+        ))
         return out[0] if one else out
 
     def strain_material_from_global(self, eps_g: np.ndarray) -> np.ndarray:
         """Strain Voigt vector(s) global -> material axes (e_m = R^T e_g R)."""
         one = eps_g.ndim == 1
         eps = np.atleast_2d(eps_g)
-        R = self.R
-        out = np.empty_like(eps)
-        for n in range(eps.shape[0]):
-            e = R.T @ voigt_to_tensor_strain(eps[n]) @ R
-            out[n] = tensor_to_voigt_strain(e)
+        tensors = np.zeros((eps.shape[0], 3, 3), dtype=eps.dtype)
+        tensors[:, 0, 0] = eps[:, 0]
+        tensors[:, 1, 1] = eps[:, 1]
+        tensors[:, 2, 2] = eps[:, 2]
+        tensors[:, 1, 2] = tensors[:, 2, 1] = 0.5 * eps[:, 3]
+        tensors[:, 0, 2] = tensors[:, 2, 0] = 0.5 * eps[:, 4]
+        tensors[:, 0, 1] = tensors[:, 1, 0] = 0.5 * eps[:, 5]
+        rotated = np.einsum("ia,nij,jb->nab", self.R, tensors, self.R,
+                            optimize=True)
+        out = np.column_stack((
+            rotated[:, 0, 0], rotated[:, 1, 1], rotated[:, 2, 2],
+            2.0 * rotated[:, 1, 2], 2.0 * rotated[:, 0, 2],
+            2.0 * rotated[:, 0, 1],
+        ))
         return out[0] if one else out
 
 

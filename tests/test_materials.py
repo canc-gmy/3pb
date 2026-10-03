@@ -10,9 +10,11 @@ from sandwich3pb.materials import (
     rotation_matrix_y,
     stiffness_matrix,
     tensor4_to_voigt,
+    tensor_to_voigt_stress,
     tsai_wu_3d,
     von_mises,
     voigt_to_tensor4,
+    voigt_to_tensor_stress,
 )
 
 
@@ -125,6 +127,53 @@ def test_tsai_wu_hand_value():
     assert tsai_wu_3d(np.array([50.0, 0, 0, 0, 0, 0]), mat) == pytest.approx(0.25)
     # pure s12 = 5 -> F66*s^2 = 1.0
     assert tsai_wu_3d(np.array([0, 0, 0, 0, 0, 5.0]), mat) == pytest.approx(1.0)
+
+
+def test_batched_stress_rotation_matches_tensor_reference():
+    mat = MaterialSpec(
+        kind="orthotropic", name="t", E1=39000, E2=9000, E3=9000,
+        nu12=0.28, nu13=0.28, nu23=0.40,
+        G12=3800, G13=3800, G23=3200,
+    )
+    quad = localized_quad_form(mat, 31.0)
+    rng = np.random.default_rng(14)
+    stresses = rng.normal(size=(12, 6))
+    expected = np.array([
+        tensor_to_voigt_stress(
+            quad.R.T @ voigt_to_tensor_stress(stress) @ quad.R
+        )
+        for stress in stresses
+    ])
+    assert np.allclose(quad.stress_material_from_global(stresses), expected)
+    assert np.allclose(
+        quad.stress_material_from_global(stresses[0]), expected[0]
+    )
+
+
+def test_batched_strain_rotation_matches_tensor_reference():
+    from sandwich3pb.materials import (
+        tensor_to_voigt_strain,
+        voigt_to_tensor_strain,
+    )
+
+    mat = MaterialSpec(
+        kind="orthotropic", name="t", E1=39000, E2=9000, E3=9000,
+        nu12=0.28, nu13=0.28, nu23=0.40,
+        G12=3800, G13=3800, G23=3200,
+    )
+    quad = localized_quad_form(mat, -26.0)
+    rng = np.random.default_rng(15)
+    strains = rng.normal(size=(12, 6))
+    expected = np.array([
+        tensor_to_voigt_strain(
+            quad.R.T @ voigt_to_tensor_strain(strain) @ quad.R
+        )
+        for strain in strains
+    ])
+    assert np.allclose(quad.strain_material_from_global(strains), expected)
+    assert np.allclose(
+        quad.strain_material_from_global(strains[0]), expected[0]
+    )
 
 
 def test_von_mises_uniaxial():
