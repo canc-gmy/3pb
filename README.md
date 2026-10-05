@@ -4,7 +4,7 @@ A Python package for **finite-element simulation of three-point bending of
 composite sandwich beams** with FEniCSx/DOLFINx. It builds a layered 3D hex
 mesh from a stackup definition, applies load and supports through **rigid
 roller contact** (penalty / augmented Lagrangian), and extracts engineering
-results into a **Markdown/HTML/PDF report** with the layup table, flexural
+results into a **Markdown/HTML/PDF/LaTeX report** with the layup table, flexural
 rigidity, max force, max deflection, force gradient and failure indices.
 
 ## Features
@@ -56,7 +56,7 @@ Outputs land in `results/glass_pvc_reference/`:
 
 | file | content |
 |---|---|
-| `report.md` / `report.html` / `report.pdf` | the results report (layup, rigidity, max force/deflection, gradient, failure) |
+| `report.md` / `report.html` / `report.pdf` / `report.tex` | the results report (at a glance, layup, response, failure, model, solver checks) |
 | `load_deflection.csv` | step history: travel, force, deflection |
 | `profile_midspan.csv` | σxx, τxz through the thickness at mid-span |
 | `profile_span.csv` | σxx, τxz along the span, sampled at each layer's mid-thickness |
@@ -261,8 +261,20 @@ at the config boundary.
 
 Report quantities are written as TeX. Markdown keeps the `$...$` markup
 (GitHub and pandoc typeset it), the PDF renders it with matplotlib's
-mathtext, and the HTML inlines each snippet as a base64 SVG — so all three
+mathtext, and the HTML inlines each snippet as a base64 SVG — so those three
 show the same mathematics with no LaTeX install, no CDN and no JavaScript.
+`report.tex` is the same tables as plain LaTeX source: compile it with
+`pdflatex` for publication-quality typography (figures are taken from
+`plots/*.pdf` and guarded, so it builds without them).
+
+Every format reads the same way: **At a glance → Layup → Structural response →
+Failure indices → Model → Solver and verification → figures**. A quantity
+appears once: run health (convergence, steps, timings) is the status line
+under the title, the failure onset is one callout, and the duplicated rows of
+earlier versions ("deflection at max force", "final roller travel",
+"load-roller force") are gone. Units sit in the column header of the
+columnar tables and in their own `unit` column of the key-value tables,
+never inside the number itself.
 
 ## License
 

@@ -1,13 +1,19 @@
-"""Report generation: Markdown, HTML and PDF with layup and result tables.
+"""Report generation: Markdown, HTML, PDF and LaTeX.
 
 The Markdown file is canonical; the HTML file embeds the same content with
 base64 images (self-contained, no external assets); the PDF is assembled
-with matplotlib PdfPages (also dependency-free).
+with matplotlib PdfPages (dependency-free); ``report.tex`` is plain
+LaTeX source that compiles with ``pdflatex``.
 
 Every quantity is written once, as TeX, in the unit system the case file
 declared -- so an SI case reports stresses in Pa and lengths in m, a
-``mm_n_mpa`` case in MPa and mm, and all three outputs show the same
+``mm_n_mpa`` case in MPa and mm, and all four outputs show the same
 numbers. See :mod:`sandwich3pb.mathtex` for how the markup is rendered.
+
+Content rule: a quantity appears exactly once. Columnar tables (layup,
+failure) carry their unit in the *header*; the key-value tables (model,
+response, solver) carry a ``unit`` column, because their unit changes from
+row to row. Booleans and counts are prose, never mathematics.
 """
 
 from __future__ import annotations
@@ -28,7 +34,7 @@ from .figures import (
     fig_thickness_profile,
     save_all_figures,
 )
-from .mathtex import render_html, tex
+from .mathtex import latex_escape, render_html, tex
 from .materials import localized_quad_form
 from .units import (
     FORCE,
@@ -85,25 +91,35 @@ def _fmt(v: Any, digits: int = 4) -> str:
     return f"{f:.{digits}g}"
 
 
-def _esc(s: str) -> str:
-    """LaTeX‑escape a few characters."""
-    s = s.replace("%", r"\%")
-    s = s.replace("&", r"\&")
-    s = s.replace("#", r"\#")
-    s = s.replace("_", r"\_")
-    s = s.replace("{", r"\{")
-    s = s.replace("}", r"\}")
-    return s
-
-
 def _unit_cell(dim: str, units: UnitSystem) -> str:
     r"""The unit as its own table cell, e.g. ``$\mathrm{mm}$``.
 
-    Values and units never share a cell: every quantity column is
-    followed by a ``unit`` column, so numbers stay readable on their own.
+    For the key-value tables only, where the unit genuinely changes
+    from row to row. Columnar tables put the unit in the header instead
+    (see :func:`_unit_head`).
     """
     symbol = units.tex_symbol(dim)
     return tex(symbol) if symbol else "—"
+
+
+def _unit_head(dim: str, units: UnitSystem) -> str:
+    r"""The unit as maths, for a column header that has one unit.
+
+    ``units.tex_symbol`` returns *bare* TeX (``\mathrm{m}``), so it must
+    be wrapped before it reaches a renderer -- un-delimited it prints
+    literally in Markdown and HTML alike.
+    """
+    symbol = units.tex_symbol(dim)
+    return tex(symbol) if symbol else ""
+
+
+def _flag(value: Any) -> str:
+    """Booleans and counts are prose -- ``yes``, not ``$yes$``."""
+    if value is None:
+        return "—"
+    if isinstance(value, (bool, np.bool_)):
+        return "yes" if value else "no"
+    return str(value)
 
 
 def _num(value: Any, units: UnitSystem, dim: str, digits: int = 4) -> str:
@@ -148,14 +164,13 @@ QUANTITY_HEADER: List[str] = ["quantity", "value", "unit"]
 
 
 def _layup_rows(cfg: Config, unit_system: Optional[UnitSystem] = None) -> Tuple[List[str], List[List[str]]]:
+    """The stackup table: one unit per column, so it lives in the header."""
     units = unit_system or cfg.unit_system
-    sym_len = units.tex_symbol(LENGTH)
-    sym_stress = units.tex_symbol(STRESS)
     header = [
         "#", "role", "material",
-        f"thickness ({sym_len})", "unit",
+        f"thickness {_unit_head(LENGTH, units)}",
         f"fibre orientation {tex(chr(92) + 'theta')} (deg)",
-        f"$E_x$ ({sym_stress})", "unit",
+        f"{tex('E_x')} ({_unit_head(STRESS, units)})",
     ]
     roles = cfg.resolve_roles()
     E_x = _axial_moduli(cfg)
@@ -167,10 +182,8 @@ def _layup_rows(cfg: Config, unit_system: Optional[UnitSystem] = None) -> Tuple[
                 roles[i],
                 layer.material,
                 _num(layer.thickness, units, LENGTH),
-                _unit_cell(LENGTH, units),
                 fmt_tex_num(layer.fibre_orientation, 4),
                 _num(E_x[i], units, STRESS),
-                _unit_cell(STRESS, units),
             ]
         )
     return header, rows
@@ -179,43 +192,56 @@ def _layup_rows(cfg: Config, unit_system: Optional[UnitSystem] = None) -> Tuple[
 def _model_rows(
     cfg: Config, summary: Dict[str, Any], u: Optional[UnitSystem] = None
 ) -> Tuple[List[str], List[List[str]]]:
+    """Geometry, loading and discretisation -- what defines the case.
+
+    The unit varies from row to row (m, then a bare count), so it stays
+    in its own column; the row labels therefore never repeat it.
+    """
     if u is None:
         u = DEFAULT_SYSTEM
     g = cfg.geometry
-    c = cfg.contact
-
-    sym_len = u.tex_symbol(LENGTH)
-    sym_force = u.tex_symbol(FORCE)
-    sym_penalty = u.tex_symbol(PENALTY)
+    m = cfg.mesh
 
     def length(value) -> List[str]:
         return [_num(value, u, LENGTH), _unit_cell(LENGTH, u)]
 
+    order = (
+        "2 (quadratic Q2)" if m.element_order == 2 else "1 (linear hex8)"
+    )
+    per_layer = ", ".join(
+        f"{role} {count}"
+        for role, count in sorted((m.elements_per_layer or {}).items())
+    ) or "—"
     rows = [
-        ["beam length " + tex("L") + f" ({sym_len})", *length(g.length)],
-        ["span (support distance) " + tex(r"L_s") + f" ({sym_len})", *length(g.span)],
-        ["width " + tex("b") + f" ({sym_len})", *length(g.width)],
-        ["total thickness " + tex("t") + f" ({sym_len})", *length(cfg.total_thickness)],
-        ["load roller radius", *length(c.roller_radius_load)],
-        ["support roller radius", *length(c.roller_radius_support)],
+        ["beam length " + tex("L"), *length(g.length)],
+        ["span (support distance) " + tex(r"L_s"), *length(g.span)],
+        ["width " + tex("b"), *length(g.width)],
+        ["total thickness " + tex("t"), *length(cfg.total_thickness)],
         ["max indentation", *length(cfg.loading.max_indentation)],
-        ["load steps", tex(str(cfg.loading.n_steps)), "—"],
-        ["half model (symmetry)", fmt_tex_num(cfg.half_model), "—"],
+        ["load steps", str(cfg.loading.n_steps), "—"],
+        ["mesh elements " + tex(r"n_x \times n_y"),
+         tex(rf"{m.elements_x} \times {m.elements_w}"), "—"],
+        ["elements per layer", per_layer, "—"],
+        ["element order", order, "—"],
+        ["half model (symmetry)", _flag(cfg.half_model), "—"],
         ["nodes / dofs", f"{summary.get('n_nodes', '—')} / "
                          f"{summary.get('n_dofs', '—')}", "—"],
-        ["contact penalty " + tex(r"K_p"),
-         _num(c.penalty, u, PENALTY, 3), _unit_cell(PENALTY, u)],
     ]
     return QUANTITY_HEADER, rows
 
 
-def _global_rows(
+def _response_rows(
     summary: Dict[str, Any], units: Optional[UnitSystem] = None
 ) -> Tuple[List[str], List[List[str]]]:
+    """The engineering answer: stiffness, strength, failure onset.
+
+    Rows that merely restate another row (``deflection at max force``
+    against ``max deflection``, ``load-roller force`` against
+    ``max force``) and the solver diagnostics are *not* here -- they
+    live in :func:`_model_rows`, :func:`_solver_rows` or the status
+    line, so each number is read once.
+    """
     u = units or DEFAULT_SYSTEM
-    sym_force = u.tex_symbol(FORCE)
-    sym_length = u.tex_symbol(LENGTH)
-    sym_rigidity = u.tex_symbol(RIGIDITY)
 
     def q(key: str, dim: str, digits: int = 4) -> List[str]:
         return [_num(summary.get(key), u, dim, digits), _unit_cell(dim, u)]
@@ -224,11 +250,11 @@ def _global_rows(
         return fmt_tex_num(summary.get(key), digits)
 
     rows = [
-        ["max force " + tex(r"P_{\max}") + f" ({sym_force})", *q("max_force_N", FORCE)],
-        ["deflection at max force " + tex("w"), *q("deflection_at_max_force_mm", LENGTH)],
-        ["max deflection " + tex(r"w_{\max}"), *q("max_deflection_mm", LENGTH)],
-        ["final roller travel", *q("final_travel_mm", LENGTH)],
-        ["force gradient " + tex(r"\frac{dP}{dw}"), *q("force_gradient_N_per_mm", GRADIENT)],
+        ["max force " + tex(r"P_{\max}"), *q("max_force_N", FORCE)],
+        ["max deflection " + tex(r"w_{\max}"),
+         *q("max_deflection_mm", LENGTH)],
+        ["force gradient " + tex(r"\frac{dP}{dw}"),
+         *q("force_gradient_N_per_mm", GRADIENT)],
         ["gradient fit " + tex("R^2"), n("gradient_fit_r2", 3), "—"],
         ["apparent flexural rigidity " + tex("D") + " (FE)",
          *q("apparent_flexural_rigidity_Nmm2", RIGIDITY)],
@@ -237,37 +263,17 @@ def _global_rows(
         ["ratio " + tex(r"D_{\mathrm{FE}}/EI_{\mathrm{layup}}"),
          n("rigidity_ratio_FE_over_layup", 4), "—"],
         ["neutral axis " + tex("z_0"), *q("neutral_axis_z_mm", LENGTH)],
-        ["load-roller force (final)", *q("load_roller_force_N", FORCE)],
         ["support reactions (final)",
          _nums(summary.get("support_reactions_N"), u, FORCE),
          _unit_cell(FORCE, u)],
-        ["force-balance residual", n("force_balance_residual", 3), "—"],
-        ["final-step contact penetration",
-         *q("max_contact_penetration_mm", LENGTH, 3)],
-        ["peak contact penetration",
-         *q("peak_contact_penetration_mm", LENGTH, 3)],
-        ["all steps converged",
-         fmt_tex_num(summary.get("all_steps_converged")), "—"],
-        ["failed load steps",
-         fmt_tex_num(summary.get("n_failed_steps")), "—"],
-        ["peak Newton iterations",
-         fmt_tex_num(summary.get("peak_newton_iterations")), "—"],
     ]
     onset = summary.get("failure_onset")
     if onset:
-        criteria = (
-            ", ".join(onset.get("criterion_keys", [])) or "criterion limit"
-        )
         rows += [
             ["predicted first failure — step",
              fmt_tex_num(onset["step"]), "—"],
-            ["onset travel", _num(onset["travel_mm"], u, LENGTH),
-             _unit_cell(LENGTH, u)],
             ["onset force", _num(onset["force_N"], u, FORCE),
              _unit_cell(FORCE, u)],
-            ["onset deflection", _num(onset["deflection_mm"], u, LENGTH),
-             _unit_cell(LENGTH, u)],
-            ["onset criterion", criteria, "—"],
         ]
     else:
         rows.append(
@@ -277,204 +283,332 @@ def _global_rows(
     return QUANTITY_HEADER, rows
 
 
-#: Rows of the global table promoted to the headline summaries.
-def _kpi_table(summary: Dict[str, Any], units: Optional[UnitSystem] = None) -> str:
-    """Render the headline KPI numbers as a Markdown table body.
+def _solver_rows(
+    cfg: Config, summary: Dict[str, Any], u: Optional[UnitSystem] = None
+) -> Tuple[List[str], List[List[str]]]:
+    """Contact settings plus the quantities that verify the solve.
 
-    Replaces the former inline ``" · ".join(...)`` with a left-aligned label
-    column and a right-aligned value+unit column.  Returns only the table
-    body; the caller adds the ``**At a glance:**`` header.
+    Run health (convergence, timings) is stated once, in the status
+    line under the report title; here sit the numbers a reviewer
+    checks against acceptance criteria.
+    """
+    if u is None:
+        u = DEFAULT_SYSTEM
+    c = cfg.contact
+
+    def length(value, digits: int = 4) -> List[str]:
+        return [_num(value, u, LENGTH, digits), _unit_cell(LENGTH, u)]
+
+    rows = [
+        ["load roller radius", *length(c.roller_radius_load)],
+        ["support roller radius", *length(c.roller_radius_support)],
+        ["contact penalty " + tex(r"K_p"),
+         _num(c.penalty, u, PENALTY, 3), _unit_cell(PENALTY, u)],
+        ["peak contact penetration",
+         *length(summary.get("peak_contact_penetration_mm"), 3)],
+        ["force-balance residual",
+         fmt_tex_num(summary.get("force_balance_residual"), 3), "—"],
+        ["peak Newton iterations",
+         _flag(summary.get("peak_newton_iterations")), "—"],
+    ]
+    return QUANTITY_HEADER, rows
+
+
+def _status_line(summary: Dict[str, Any]) -> str:
+    """Run health in one line: convergence, steps, timings.
+
+    Stated exactly once per report, so the tables never repeat it.
+    """
+    verdict = (
+        "all steps converged"
+        if summary.get("all_steps_converged")
+        else "NOT all steps converged"
+    )
+    return " · ".join(
+        [
+            verdict,
+            f"{summary.get('n_steps', '—')} load steps",
+            f"assembly {_fmt(summary.get('assembly_time_s'), 3)} s",
+            f"solve {_fmt(summary.get('solve_time_s'), 3)} s",
+        ]
+    )
+
+
+#: The headline block, promoted from the response table.
+def _kpi_table(summary: Dict[str, Any], units: Optional[UnitSystem] = None) -> str:
+    """The headline numbers as a real Markdown table.
+
+    GitHub needs a header row *and* a ``|---|`` delimiter: without them
+    the block renders as literal pipe text, which is what the previous
+    hand-rolled ``" · ".join`` body produced. Returns the whole table.
     """
     u = units or DEFAULT_SYSTEM
     rows = _kpi_rows(summary, u)
     if not rows:
         return ""
-    col_width = max(
-        max(len(str(row[0])) for row in rows),
-        max(len(str(row[1])) for row in rows),
-    )
-    def line(label: str, value: str, unit: str) -> str:
-        unit_part = f" {unit}" if str(unit) != "—" else ""
-        return f"| {label.ljust(col_width)} | {value}{unit_part} |"
-    body = "\n".join(line(row[0], str(row[1]), row[2]) for row in rows)
-    return body
+    return _md_table(["quantity", "value", "unit"], rows, numeric_cols={1})
 
 
-def _latex_column_spec(numeric_cols: Optional[set]) -> str:
-    """Return a LaTeX column specification string from a set of numeric column indices.
+def build_latex(results, plots_dir: str = "plots") -> str:
+    r"""Generate a compilable LaTeX ``report.tex`` string from *results*.
 
-    In LaTeX, ``l`` = left-aligned, ``c`` = centered, ``r`` = right-aligned.
-    Markdown's ``:--`` (right) maps to ``r``, ``--`` (left) maps to ``l``,
-    and ``:-:`` (center) maps to ``c``.  We default left-alignment for all
-    columns and override those in ``numeric_cols`` to right-aligned.
-    """
-    n = None  # we'll infer from the first caller's header length at render time
-    # We return a placeholder; the actual spec will be built per-table.
-    return "l"  # default, will be overridden
+    It shares every table builder with the Markdown/HTML/PDF outputs, so
+    all four formats show the same numbers. Prose goes through
+    :func:`sandwich3pb.mathtex.latex_escape`, which leaves ``$...$``
+    mathematics untouched -- escaping the whole cell, as the previous
+    version did, turned ``$E_x$`` into ``$E\_x$`` and
+    ``$3.9\times 10^{10}$`` into ``$3.9\times 10^\{10\}$``.
 
-
-def build_latex(results) -> str:
-    """Generate a LaTeX ``report.tex`` string from *results*.
-
-    The output uses the ``article`` class with ``booktabs`` and
-    ``tabular`` environments for all tables, and ``figure`` placeholders
-    for the generated plots.  It reuses the same data structures as
-    ``build_markdown`` so the same numbers appear in both outputs.
-
-    The returned string can be written to ``report.tex`` and compiled
-    with ``pdflatex`` for publication-quality PDF, or simply read as
-    structured source.
+    ``plots_dir`` is resolved relative to where ``report.tex`` is written
+    (it sits next to ``plots/``), and every figure is guarded with
+    ``\IfFileExists`` so the source still compiles when the figures are
+    absent.
     """
     cfg = results.cfg
     s = results.summary
     u = cfg.unit_system
 
-    # ------------------------------------------------------------------
-    # Layup table
-    # ------------------------------------------------------------------
+    def figure(name: str, caption: str) -> str:
+        path = f"{plots_dir.strip('/')}/{name}.pdf"
+        include = (
+            r"\IfFileExists{" + path
+            + r"}{\includegraphics[width=0.94\linewidth]{" + path
+            + r"}}{\textit{figure not found}}"
+        )
+        return "\n".join(
+            [
+                r"\begin{figure}[htbp]",
+                r"\centering",
+                include,
+                r"\caption{" + latex_escape(caption) + "}",
+                r"\end{figure}",
+                r"\clearpage",
+            ]
+        )
+
+    kpi_tabular = _build_latex_tabular(QUANTITY_HEADER, _kpi_rows(s, u), {1})
+
     layup_header, layup_rows = _layup_rows(cfg, u)
-    # Build LaTeX column spec: first three columns are left (label/role/material),
-    # then value columns right, then unit columns left.  We determine this from
-    # the header layout: #, role, material, thickness(E_x), unit, fibre orient, Ex, unit
-    # Numeric (right‑aligned) are thickness and E_x → columns 3 and 6 (0‑based).
-    layup_numerics = {3, 6}
-    layup_spec = "".join(
-        "r" if i in layup_numerics else "l" for i in range(len(layup_header))
+    layup_tabular = _build_latex_tabular(layup_header, layup_rows, {0, 3, 4, 5})
+
+    response_header, response_rows = _response_rows(s, u)
+    response_tabular = _build_latex_tabular(response_header, response_rows, {1})
+
+    model_header, model_rows = _model_rows(cfg, s, u)
+    model_tabular = _build_latex_tabular(model_header, model_rows, {1})
+
+    solver_header, solver_rows = _solver_rows(cfg, s, u)
+    solver_tabular = _build_latex_tabular(solver_header, solver_rows, {1})
+
+    f_header, f_rows = _failure_rows(s, u)
+    failure_tabular = (
+        _build_latex_tabular(f_header, f_rows, {4, 5}) if f_rows else ""
     )
 
-    layup_tabular = _build_latex_tabular(layup_header, layup_rows, layup_spec)
+    onset = s.get("failure_onset")
+    if onset:
+        criteria = ", ".join(onset.get("criterion_keys", [])) or "criterion limit"
+        onset_line = (
+            r"\textbf{Predicted first failure --- step "
+            + str(onset["step"]) + " (" + latex_escape(criteria) + ")}: travel "
+            + fmt_tex_qty(onset["travel_mm"], u, LENGTH)
+            + ", force " + fmt_tex_qty(onset["force_N"], u, FORCE)
+            + ", deflection " + fmt_tex_qty(onset["deflection_mm"], u, LENGTH)
+            + ". Onset is an estimate at the configured load-step "
+            "resolution; no progressive damage is modeled."
+        )
+    else:
+        onset_line = (
+            r"\textbf{No predicted failure:} none of the existing criteria "
+            "reached 1.0 in the simulated steps."
+        )
 
-    # ------------------------------------------------------------------
-    # Model table
-    # ------------------------------------------------------------------
-    model_header, model_rows = _model_rows(cfg, s, u)
-    model_numerics = {1}  # value column
-    model_spec = "".join("r" if i in model_numerics else "l" for i in range(len(model_header)))
-    model_tabular = _build_latex_tabular(model_header, model_rows, model_spec)
-
-    # ------------------------------------------------------------------
-    # Global results table
-    # ------------------------------------------------------------------
-    global_header, global_rows = _global_rows(s, u)
-    global_numerics = {1}  # value column
-    global_spec = "".join("r" if i in global_numerics else "l" for i in range(len(global_header)))
-    global_tabular = _build_latex_tabular(global_header, global_rows, global_spec)
-
-    # ------------------------------------------------------------------
-    # Failure indices table
-    # ------------------------------------------------------------------
-    f_header, f_rows = _failure_rows(s, u)
-    # In the failure table the numeric columns are max value (4) and limit (5)
-    failure_numerics = {4, 5}
-    failure_spec = "".join("r" if i in failure_numerics else "l" for i in range(len(f_header)))
-    failure_tabular = _build_latex_tabular(f_header, f_rows, failure_spec)
-
-    # ------------------------------------------------------------------
-    # Figure placeholders
-    # ------------------------------------------------------------------
-    plots_dir = getattr(results, "_plots_dir", "plots")
-    figs = {}
-    for name in ("laminate_stackup", "load_deflection", "thickness_profile",
-                 "stress_along_span"):
-        path = os.path.join(plots_dir, f"{name}.svg")
-        figs[name] = f"\\begin{{figure}}[htbp]\\centering\\includegraphics[width=\\linewidth]{{{name}.svg}}\\caption{{{name.replace('_', ' ')}}}\\end{{figure}}"
-
-    # ------------------------------------------------------------------
-    # Assemble the full LaTeX document
-    # ------------------------------------------------------------------
     lines = [
-        r"\documentclass{article}",
+        r"\documentclass[10pt]{article}",
         r"\usepackage[utf8]{inputenc}",
         r"\usepackage[T1]{fontenc}",
+        r"\usepackage[margin=2cm]{geometry}",
+        r"\usepackage{array}",
         r"\usepackage{booktabs}",
         r"\usepackage{graphicx}",
         r"\usepackage{amsmath}",
+        r"\setlength{\tabcolsep}{2pt}",
+        rf"\title{{Three-Point Bending Report --- {latex_escape(cfg.name)}}}",
+        r"\author{sandwich3pb (FEniCSx/DOLFINx)}",
+        r"\date{" + datetime.date.today().isoformat() + "}",
         r"\begin{document}",
-        f"\n\\title{{Three-Point Bending Report — {_esc(cfg.name)}}}",
-        f"\\maketitle",
+        r"\maketitle",
         "",
-        f"All quantities are given in the case file's own units "
-        f"(``{u.name}`` — length {u.length}, stress {u.stress}, "
-        f"force {u.force}).  Every value sits in its own column with the "
+        "All quantities are given in the case file's own units "
+        f"(\\texttt{{{u.name}}} --- length {u.length}, stress {u.stress}, "
+        f"force {u.force}). Every value sits in its own column with the "
         "unit in the column beside it.",
         "",
-        "## Layup / stackup",
+        r"\textbf{Run:} " + latex_escape(_status_line(s)) + ".",
+        "",
+        r"\section*{At a glance}",
+        "",
+        kpi_tabular,
+        "",
+        r"\section*{Layup / stackup}",
         "",
         layup_tabular,
         "",
-        "## Model",
+        r"\section*{Structural response}",
         "",
-        model_tabular,
+        response_tabular,
         "",
-        "## Global results",
+        r"\section*{Failure indices}",
         "",
-        global_tabular,
-        "",
-        "## Failure indices",
+        "Onset indicators from recovered grid-corner stresses, maxima per "
+        "layer; values at or above $1.0$ indicate predicted failure (no "
+        "progressive damage is modelled). Hotspots are $x/y/z$; material "
+        "stresses are in the [11, 22, 33, 23, 13, 12] order.",
         "",
         failure_tabular,
         "",
+        onset_line,
+        "",
+        r"\section*{Model}",
+        "",
+        model_tabular,
+        "",
+        r"\section*{Solver and verification}",
+        "",
+        solver_tabular,
+        "",
+        r"\section*{Laminate cross-section (true thickness)}",
+        figure(
+            "laminate_stackup",
+            "Through-thickness axis at true scale; the beam axis is "
+            "compressed for readability.",
+        ),
+        r"\section*{Load--deflection}",
+        figure("load_deflection", "Load--deflection curve."),
+        r"\section*{Mid-span through-thickness profile}",
+        figure(
+            "thickness_profile",
+            "Grid-corner recovery averaged across the width, separately per "
+            "layer: stress can jump at bonded interfaces; red is tensile, "
+            "blue compressive, and shear colour shows sign, not severity.",
+        ),
+        r"\section*{Stress along the span}",
+        figure(
+            "stress_along_span",
+            "Bending stress at one station per layer on the full-beam span "
+            "coordinate; the predicted-failure marker is shown where "
+            "available.",
+        ),
+        r"\end{document}",
     ]
-    lines.append("")
-    lines.append(r"\section*{Laminate cross-section (true thickness)}")
-    lines.append(figs.get("laminate_stackup", ""))
-    lines.append("")
-    lines.append(r"Through-thickness axis at true scale; the beam axis is compressed")
-    lines.append("for readability.")
-    lines.append("")
-    lines.append(r"\section*{Load--deflection}")
-    lines.append(figs.get("load_deflection", ""))
-    lines.append("")
-    lines.append(r"\section*{Mid-span through-thickness profile}")
-    lines.append(figs.get("thickness_profile", ""))
-    lines.append("")
-    lines.append(r"The plot shows the grid-corner recovered stress averaged across beam width,")
-    lines.append("separately within each material layer; stress can jump at bonded interfaces.")
-    lines.append("Red indicates positive/tensile stress and blue negative/compressive stress.")
-    lines.append("Markers are recovery samples; the fitted lines guide the eye only.")
-    lines.append("Shear color indicates sign, not failure severity.")
-    lines.append("")
-    lines.append(r"\section*{Stress along the span}")
-    lines.append(figs.get("stress_along_span", ""))
-    lines.append("")
-    lines.append(r"Bending stress is shown at a representative station in each face/core layer;")
-    lines.append("the marker position is a grid-corner recovery, averaged through width. The")
-    lines.append("full-beam span coordinate is used for both full and half models. The first")
-    lines.append("predicted failure marker is shown where available.")
-    lines.append("")
-    lines.append(r"\section*{Convergence}")
-    n_steps = s.get("n_steps", "—")
-    assembly = _fmt(s.get("assembly_time_s"), 3)
-    solve = _fmt(s.get("solve_time_s"), 3)
-    lines.append(f"{n_steps} load steps, assembly {assembly} s, solve {solve} s.")
-    lines.append("")
-    lines.append(r"\end{document}")
 
     return "\n".join(lines)
 
 
+_MATH_SPAN = re.compile(r"\$([^$\n]+)\$")
+
+
+def _breakable_math(text: str) -> str:
+    r"""Close and reopen maths around top-level ``", "`` separators.
+
+    TeX cannot break a line inside ``$0.1, -0.02, 0.0015$`` -- maths has
+    no breakpoints -- so a ``p{}`` column holding such a list overflows
+    into its neighbour. Writing ``$0.1$, $-0.02$, $0.0015$`` puts the
+    comma and the following space back in text mode, where TeX may
+    break, and renders the same numbers.
+    """
+
+    def split_once(match: "re.Match[str]") -> str:
+        inner = match.group(1)
+        depth = 0
+        cutpoints: List[int] = []
+        for i, char in enumerate(inner):
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+            elif char == "," and depth == 0 and inner[i + 1:i + 2] == " ":
+                cutpoints.append(i)
+        if not cutpoints:
+            return match.group(0)
+        parts: List[str] = []
+        start = 0
+        for cut in cutpoints:
+            parts.append(inner[start:cut].strip())
+            start = cut + 2
+        parts.append(inner[start:].strip())
+        if any(not part for part in parts):
+            return match.group(0)
+        return ", ".join(f"${part}$" for part in parts)
+
+    return _MATH_SPAN.sub(split_once, text)
+
+
 def _build_latex_tabular(header: List[str], rows: List[List[str]],
-                         spec: str) -> str:
-    """Produce a LaTeX ``tabular`` environment from header/rows and a column spec."""
+                         numeric: Any = frozenset()) -> str:
+    r"""A ``tabular`` of wrapping ``p{}`` columns sized from visible text.
+
+    ``p{}`` cells wrap rather than overflow -- the failure table's
+    material-stress header is far wider than the text block -- and
+    numeric columns are right-aligned with ``\raggedleft``, hence the
+    ``array`` package. Every cell is escaped as prose *around* its maths,
+    never as one opaque string.
+    """
     ncol = len(header)
-    cells = [_esc(str(h)) for h in header]
-    body_cells = []
-    for r in rows:
-        row_cells = [_esc(str(c)) for c in r]
-        body_cells.append(row_cells)
+    # Widths are proportional to the *longest unbreakable run* in each
+    # column (``glass_epoxy``, ``layer_0``, ``0.08419``): a ``p{}``
+    # column only wraps at spaces, so a column narrower than its longest
+    # token spills the word over its neighbour. The remaining budget is
+    # then shared out by full cell length, so wide columns wrap instead
+    # of squeezing the narrow ones.
+    floors: List[int] = []
+    contents: List[int] = []
+    for i in range(ncol):
+        texts = [str(header[i])] + [str(r[i]) for r in rows]
+        visible = [_visible_len(text) for text in texts]
+        content = max(visible)
+        floor = max(
+            max((_visible_len(token) for token in text.split()), default=1)
+            for text in texts
+        )
+        floor = max(floor, 2)
+        floors.append(floor)
+        contents.append(max(content, floor))
 
-    col_format = spec.ljust(ncol, "l")  # ensure exactly ncol spec chars
+    # A4 with 2cm margins: \linewidth ~= 483pt; 10pt Computer Modern
+    # averages ~5.5pt a character, digits included.
+    char_pt = 5.5
+    linewidth_pt = 483.0
+    budget_pt = 0.88 * linewidth_pt          # the rest is \tabcolsep
+    natural = [floor * char_pt for floor in floors]
+    spare = max(budget_pt - sum(natural), 0.0)
+    spread = sum(c - f for c, f in zip(contents, floors)) or 1.0
+    widths = [
+        natural[i] + spare * (contents[i] - floors[i]) / spread
+        for i in range(ncol)
+    ]
 
-    lines = [r"\begin{tabular}{" + col_format + "}"]
-    # header row
-    lines.append("    \\toprule")
-    lines.append(" & ".join(cells) + r" \\")
-    lines.append("    \\midrule")
-    # data rows
-    for row_cells in body_cells:
-        row_str = " & ".join(row_cells)
-        lines.append(f"    {row_str} \\\\")
-    lines.append(r"    \\bottomrule")
+    spec: List[str] = []
+    for i, width in enumerate(widths):
+        fraction = width / linewidth_pt
+        if i in numeric:
+            spec.append(r">{\raggedleft\arraybackslash}p{" + f"{fraction:.4f}" + r"\linewidth}")
+        else:
+            spec.append("p{" + f"{fraction:.4f}" + r"\linewidth}")
+
+    lines = [r"\begin{tabular}{" + "".join(spec) + "}"]
+    lines.append(r"\toprule")
+    lines.append(
+        " & ".join(_breakable_math(latex_escape(str(h))) for h in header)
+        + r" \\"
+    )
+    lines.append(r"\midrule")
+    for row in rows:
+        lines.append(
+            " & ".join(_breakable_math(latex_escape(str(c))) for c in row)
+            + r" \\"
+        )
+    lines.append(r"\bottomrule")
     lines.append(r"\end{tabular}")
 
     return "\n".join(lines)
@@ -493,7 +627,7 @@ def _kpi_rows(
     summary: Dict[str, Any], units: Optional[UnitSystem] = None
 ) -> List[List[str]]:
     """The handful of headline numbers shown before everything else."""
-    _, rows = _global_rows(summary, units)
+    _, rows = _response_rows(summary, units)
     return [
         row for row in rows
         if any(str(row[0]).startswith(prefix) for prefix in _KPI_PREFIXES)
@@ -503,16 +637,24 @@ def _kpi_rows(
 def _failure_rows(
     summary: Dict[str, Any], units: Optional[UnitSystem] = None
 ) -> Tuple[List[str], List[List[str]]]:
+    r"""Per-layer failure indices; each column's unit sits in its header.
+
+    The stress column used to name its unit by gluing ``\mathrm{Pa}``
+    onto the Voigt indices -- ``[\mathrm{Pa}11,...]`` -- which printed as
+    gibberish in every format. The components are now proper maths and
+    the unit is a separate, delimited span.
+    """
     units = units or DEFAULT_SYSTEM
-    sym_stress = units.tex_symbol(STRESS)
+    stress_head = tex(
+        r"\sigma_{11},\sigma_{22},\sigma_{33},"
+        r"\sigma_{23},\sigma_{13},\sigma_{12}"
+    )
     header = [
         "layer", "role", "material", "criterion", "max value", "limit",
-        "hotspot x/y/z", "unit",
-        f"material stress [{sym_stress}11,{sym_stress}22,{sym_stress}33,{sym_stress}23,{sym_stress}13,{sym_stress}12]", "unit",
+        f"hotspot {tex('x,y,z')} ({_unit_head(LENGTH, units)})",
+        f"material stress {stress_head} ({_unit_head(STRESS, units)})",
     ]
     limit = tex("1.0")
-    hotspot_unit = _unit_cell(LENGTH, units)
-    stress_unit = _unit_cell(STRESS, units)
     rows: List[List[str]] = []
     by_layer = summary.get("failure_by_layer", {}) or {}
     for key, d in sorted(by_layer.items(),
@@ -524,10 +666,8 @@ def _failure_rows(
                 fmt_tex_num(d.get("max_tsai_wu"), 4),
                 limit,
                 _nums(d.get("max_tsai_wu_location_mm"), units, LENGTH),
-                hotspot_unit,
                 _nums(d.get("max_tsai_wu_stress_material_MPa"),
                       units, STRESS),
-                stress_unit,
             ])
         else:
             rows.append([
@@ -536,9 +676,7 @@ def _failure_rows(
                 + tex(r"\frac{\vert\tau_{xz}\vert}{\tau_c}"),
                 fmt_tex_num(d.get("max_shear_ratio"), 4), limit,
                 _nums(d.get("max_shear_location_mm"), units, LENGTH),
-                hotspot_unit,
                 _num(d.get("max_shear_stress_MPa"), units, STRESS),
-                stress_unit,
             ])
             rows.append([
                 key, "core", d.get("material", "—"),
@@ -546,9 +684,7 @@ def _failure_rows(
                 + tex(r"\frac{\sigma_{zz}}{\sigma_c}"),
                 fmt_tex_num(d.get("max_crushing_ratio"), 4), limit,
                 _nums(d.get("max_crushing_location_mm"), units, LENGTH),
-                hotspot_unit,
                 _num(d.get("max_crushing_stress_MPa"), units, STRESS),
-                stress_unit,
             ])
     return header, rows
 
@@ -584,7 +720,8 @@ def _md_table(
 
     if numeric_cols is not None:
         sep_parts = [
-            ":--" if i in numeric_cols else "--" for i in range(len(header))
+            ":---" if i in numeric_cols else "---"
+            for i in range(len(header))
         ]
     else:
         sep_parts = ["---"] * len(header)
@@ -606,14 +743,19 @@ def _md_img(results, name: str, alt: str) -> str:
 
 
 def build_markdown(results) -> str:
+    """The canonical report: one number per row, one statement per fact.
+
+    Sections run At a glance → Layup → Structural response → Failure →
+    Model → Solver and verification → figures. Run health appears once,
+    in the status line; the onset is stated once, in the failure section.
+    """
     cfg = results.cfg
     s = results.summary
     u = cfg.unit_system
     layup_header, layup_rows = _layup_rows(cfg, u)
     model_header, model_rows = _model_rows(cfg, s, u)
-    global_header, global_rows = _global_rows(s, u)
-
-    glance_md = _kpi_table(s, u)
+    response_header, response_rows = _response_rows(s, u)
+    solver_header, solver_rows = _solver_rows(cfg, s, u)
 
     lines = [
         f"# Three-Point Bending Report — {cfg.name}",
@@ -621,33 +763,34 @@ def build_markdown(results) -> str:
         f"Generated {datetime.datetime.now().isoformat(timespec='seconds')} "
         "with sandwich3pb (FEniCSx/DOLFINx).",
         "",
+        f"**Run:** {_status_line(s)}",
+        "",
         "All quantities are given in the case file's own units "
         f"(`units: {u.name}` — length {u.length}, stress {u.stress}, "
-        f"force {u.force}). Every value sits in its own column with the "
-        "unit in the column beside it.",
+        f"force {u.force}).",
         "",
-        f"**At a glance:**\n{glance_md}",
+        "**At a glance:**",
+        _kpi_table(s, u),
         "",
         "## Layup / stackup",
         "",
-        _md_table(layup_header, layup_rows, numeric_cols={3, 6}),
+        _md_table(layup_header, layup_rows, numeric_cols={0, 3, 4, 5}),
         "",
-        "## Model",
+        "## Structural response",
         "",
-        _md_table(model_header, model_rows, numeric_cols={1}),
-        "",
-        "## Global results",
-        "",
-        _md_table(global_header, global_rows, numeric_cols={1}),
+        _md_table(response_header, response_rows, numeric_cols={1}),
         "",
         "## Failure indices",
         "",
-        "Existing criteria are engineering onset indicators, not a progressive-damage model. Values at or above $1.0$ indicate predicted failure; onset is resolved to the configured load-step interval. The table reports maxima from recovered grid-corner stresses per layer; hotspot coordinates are x/y/z, and the listed six stress components are in material axes in [11, 22, 33, 23, 13, 12] order.",
+        "Onset indicators from recovered grid-corner stresses, maxima per "
+        "layer; values at or above $1.0$ indicate predicted failure (no "
+        "progressive damage is modeled). Hotspots are x/y/z; material "
+        "stresses are in the [11, 22, 33, 23, 13, 12] order.",
         "",
     ]
     f_header, f_rows = _failure_rows(s, u)
     if f_rows:
-        lines += [_md_table(f_header, f_rows), ""]
+        lines += [_md_table(f_header, f_rows, numeric_cols={4, 5}), ""]
     else:
         lines += ["_no failure data available_", ""]
 
@@ -671,6 +814,14 @@ def build_markdown(results) -> str:
         ]
 
     lines += [
+        "## Model",
+        "",
+        _md_table(model_header, model_rows, numeric_cols={1}),
+        "",
+        "## Solver and verification",
+        "",
+        _md_table(solver_header, solver_rows, numeric_cols={1}),
+        "",
         "## Laminate cross-section (true thickness)",
         "",
         _md_img(results, "laminate_stackup", "laminate"),
@@ -686,19 +837,16 @@ def build_markdown(results) -> str:
         "",
         _md_img(results, "thickness_profile", "profile"),
         "",
-        "The plot shows the grid-corner recovered stress averaged across beam width, separately within each material layer; stress can jump at bonded interfaces. Red indicates positive/tensile stress and blue negative/compressive stress. Markers are recovery samples; the fitted lines guide the eye only. Shear color indicates sign, not failure severity.",
+        "Grid-corner recovery averaged across the width, separately per "
+        "layer: stress can jump at bonded interfaces. Red is tensile, blue "
+        "compressive; shear colour shows sign, not severity.",
         "",
         "## Stress along the span",
         "",
         _md_img(results, "stress_along_span", "span"),
         "",
-        "Bending stress is shown at a representative station in each face/core layer; the marker position is a grid-corner recovery, averaged through width. The full-beam span coordinate is used for both full and half models. The first predicted failure marker is shown where available.",
-        "",
-        "## Convergence",
-        "",
-        f"{s.get('n_steps', '—')} load steps, "
-        f"assembly {_fmt(s.get('assembly_time_s'), 3)} s, "
-        f"solve {_fmt(s.get('solve_time_s'), 3)} s.",
+        "Bending stress at one station per layer on the full-beam span "
+        "coordinate; the predicted-failure marker is shown where available.",
         "",
     ]
     return "\n".join(lines)
@@ -765,7 +913,8 @@ def build_html(results, include_span_profile: bool = True) -> str:
     u = cfg.unit_system
     layup_header, layup_rows = _layup_rows(cfg, u)
     model_header, model_rows = _model_rows(cfg, s, u)
-    global_header, global_rows = _global_rows(s, u)
+    response_header, response_rows = _response_rows(s, u)
+    solver_header, solver_rows = _solver_rows(cfg, s, u)
     f_header, f_rows = _failure_rows(s, u)
 
     def cell(value: Any) -> str:
@@ -836,11 +985,34 @@ def build_html(results, include_span_profile: bool = True) -> str:
     cards_html = f'<div class="cards">{cards}</div>' if cards else ""
 
     converged = s.get("all_steps_converged")
-    conv_html = (
+    verdict = (
         '<span class="ok">all steps converged</span>'
         if converged
         else '<span class="bad">not all steps converged</span>'
     )
+    status_html = (
+        f'<p class="meta">{verdict} · {s.get("n_steps", "—")} load steps · '
+        f'assembly {_fmt(s.get("assembly_time_s"), 3)} s · '
+        f'solve {_fmt(s.get("solve_time_s"), 3)} s</p>'
+    )
+
+    onset = s.get("failure_onset")
+    if onset:
+        criteria = ", ".join(onset.get("criterion_keys", [])) or "criterion limit"
+        onset_html = (
+            f'<div class="onset"><strong>Predicted first failure — '
+            f"step {onset['step']}</strong>: {criteria}; travel "
+            f"{cell(fmt_tex_qty(onset['travel_mm'], u, LENGTH))}, force "
+            f"{cell(fmt_tex_qty(onset['force_N'], u, FORCE))}, deflection "
+            f"{cell(fmt_tex_qty(onset['deflection_mm'], u, LENGTH))}. "
+            "Onset is an estimate at the configured load-step resolution; "
+            "no progressive damage is modeled.</div>"
+        )
+    else:
+        onset_html = (
+            '<div class="onset">No existing failure criterion reached 1.0 '
+            "in the simulated steps.</div>"
+        )
 
     plots_dir = _plots_dir(results)
     body = "\n".join(
@@ -849,42 +1021,44 @@ def build_html(results, include_span_profile: bool = True) -> str:
             f'<p class="meta">Generated '
             f"{datetime.datetime.now().isoformat(timespec='seconds')} with "
             "sandwich3pb (FEniCSx/DOLFINx)</p>",
+            status_html,
             cell(
                 "<p>All quantities are in the case file's own units "
                 f"({u.name}): length {u.length}, stress {u.stress}, "
-                f"force {u.force}. Every value sits in its own column with "
-                "the unit in the column beside it.</p>"
+                f"force {u.force}.</p>"
             ),
             cards_html,
-            "<h2>Laminate cross-section (true thickness)</h2>",
-            img(os.path.join(plots_dir, "laminate_stackup.svg")),
             "<h2>Layup / stackup</h2>",
-            table(layup_header, layup_rows, numeric={3, 5, 6}),
+            table(layup_header, layup_rows, numeric={0, 3, 4, 5}),
+            "<h2>Structural response</h2>",
+            table(response_header, response_rows, numeric={1}),
+            "<h2>Failure indices</h2>",
+            "<p>Onset indicators from recovered grid-corner stresses, "
+            "maxima per layer; values at or above 1.0 indicate predicted "
+            "failure (no progressive damage is modeled). Hotspots are "
+            "x/y/z; material stresses are in the [11, 22, 33, 23, 13, "
+            "12] order.</p>",
+            table(f_header, f_rows, highlight_failure=True,
+                  numeric={4, 5, 6, 7})
+            if f_rows else "<p><em>no data</em></p>",
+            onset_html,
             "<h2>Model</h2>",
             table(model_header, model_rows, numeric={1}),
-            "<h2>Global results</h2>",
-            table(global_header, global_rows, numeric={1}),
-            "<h2>Failure indices</h2>",
-            "<p>Existing criteria are engineering onset indicators, not a "
-            "progressive-damage model. Values at or above 1.0 indicate "
-            "predicted failure; onset is resolved to the configured step "
-            "interval. The table reports per-layer maxima from recovered "
-            "grid-corner stresses; hotspot coordinates are x/y/z and the "
-            "six material-axis stress components are in [11, 22, 33, 23, "
-            "13, 12] order.</p>",
-            table(f_header, f_rows, highlight_failure=True,
-                  numeric={4, 5, 6, 8})
-            if f_rows else "<p><em>no data</em></p>",
+            "<h2>Solver and verification</h2>",
+            table(solver_header, solver_rows, numeric={1}),
+            "<h2>Laminate cross-section (true thickness)</h2>",
+            img(os.path.join(plots_dir, "laminate_stackup.svg")),
+            "<p>Through-thickness axis at true scale; the beam axis is "
+            "compressed for readability.</p>",
             "<h2>Load–deflection</h2>",
             img(os.path.join(plots_dir, "load_deflection.svg")),
             "<h2>Mid-span through-thickness profile</h2>",
             img(os.path.join(plots_dir, "thickness_profile.svg")),
             cell(
-                "<p>Stress is recovered at grid corners and averaged across "
-                "beam width, separately by material layer. Stress may jump "
-                "at bonded interfaces. Red is positive/tensile and blue is "
-                "negative/compressive; shear color shows sign, not severity. "
-                "Lines guide the eye; markers are recovered values.</p>"
+                "<p>Grid-corner recovery averaged across the width, "
+                "separately per layer: stress can jump at bonded "
+                "interfaces. Red is tensile, blue compressive; shear "
+                "colour shows sign, not severity.</p>"
             ),
         ]
     )
@@ -907,29 +1081,6 @@ def build_html(results, include_span_profile: bool = True) -> str:
 
     if span_section:
         body += "\n" + "\n".join(span_section)
-
-    onset = s.get("failure_onset")
-    if onset:
-        criteria = ", ".join(onset.get("criterion_keys", [])) or "criterion limit"
-        onset_html = (
-            f'<div class="onset"><strong>Predicted first failure — '
-            f"step {onset['step']}</strong>: {criteria}; travel "
-            f"{cell(fmt_tex_qty(onset['travel_mm'], u, LENGTH))}, force "
-            f"{cell(fmt_tex_qty(onset['force_N'], u, FORCE))}, deflection "
-            f"{cell(fmt_tex_qty(onset['deflection_mm'], u, LENGTH))}. "
-            "Onset is an estimate at the configured load-step resolution; "
-            "no progressive damage is modeled.</div>"
-        )
-    else:
-        onset_html = (
-            '<div class="onset">No existing failure criterion reached 1.0 '
-            "in the simulated steps.</div>"
-        )
-    body += "\n" + onset_html + "\n"
-    body += f"<h2>Convergence</h2><p>{conv_html} — "
-    body += f"{s.get('n_steps', '—')} load steps, assembly "
-    body += f"{_fmt(s.get('assembly_time_s'), 3)} s, solve "
-    body += f"{_fmt(s.get('solve_time_s'), 3)} s.</p>"
 
     return _HTML_TEMPLATE.format(title=f"3PB Report — {cfg.name}", body=body)
 
@@ -962,11 +1113,11 @@ def build_pdf(results, pdf_path: str) -> str:
     u = cfg.unit_system
 
     def page_footer(fig, number: int) -> None:
-        fig.text(0.08, 0.022,
+        fig.text(0.05, 0.022,
                  "sandwich3pb · " + cfg.name + " · "
                  + datetime.date.today().isoformat(),
                  fontsize=8, color="#8a8f94")
-        fig.text(0.92, 0.022, f"page {number}", fontsize=8,
+        fig.text(0.95, 0.022, f"page {number}", fontsize=8,
                  color="#8a8f94", ha="right")
 
     def page_head(fig) -> None:
@@ -974,17 +1125,17 @@ def build_pdf(results, pdf_path: str) -> str:
         never runs into the right-aligned units label."""
         title = f"Three-Point Bending — {cfg.name}"
         units_label = f"units: {cfg.units}"
-        # 8.27 in page, 0.08..0.92 usable band; bold 12 pt measures
+        # 8.27 in page, 0.05..0.95 usable band; bold 12 pt measures
         # ~0.66 em per glyph for this string, so budget on that
-        avail_pt = (0.92 - 0.08) * 8.27 * 72 - len(units_label) * 5.6 - 24
+        avail_pt = (0.95 - 0.05) * 8.27 * 72 - len(units_label) * 5.6 - 24
         fs = min(12.0, avail_pt / max(len(title) * 0.66, 1))
-        fig.text(0.08, 0.952, title, fontsize=fs, weight="bold",
+        fig.text(0.05, 0.952, title, fontsize=fs, weight="bold",
                  color="#2c5f8a")
-        fig.text(0.92, 0.952, units_label, fontsize=9,
+        fig.text(0.95, 0.952, units_label, fontsize=9,
                  color="#555555", ha="right")
 
     with PdfPages(pdf_path) as pdf:
-        # ---- page 1: title + laminate + layup + key results -------------
+        # ---- page 1: title + status + layup + headline -----------------
         fig = plt.figure(figsize=(8.27, 11.69), dpi=110)
         fig.text(0.5, 0.955, f"Three-Point Bending — {cfg.name}",
                  ha="center", fontsize=16, weight="bold")
@@ -992,41 +1143,58 @@ def build_pdf(results, pdf_path: str) -> str:
                  "sandwich3pb · FEniCSx/DOLFINx · "
                  + datetime.date.today().isoformat(),
                  ha="center", fontsize=9, color="#555555")
+        fig.text(0.5, 0.913, _status_line(s), ha="center",
+                 fontsize=9, color="#333333")
 
-        lam_ax = fig.add_axes([0.06, 0.62, 0.88, 0.27])
+        lam_ax = fig.add_axes([0.06, 0.64, 0.88, 0.25])
         fig_laminate_stackup(cfg, ax=lam_ax)
 
         layup_header, layup_rows = _layup_rows(cfg, u)
         bottom = _draw_table(fig, layup_header, layup_rows,
-                             title="Layup / stackup", top=0.56,
-                             numeric={3, 5, 6})
+                             title="Layup / stackup", top=0.58,
+                             numeric={0, 3, 4, 5})
         kpi = _kpi_rows(s, cfg.unit_system)
         if kpi:
-            _draw_table(fig, QUANTITY_HEADER, kpi, title="Key results",
+            _draw_table(fig, QUANTITY_HEADER, kpi, title="At a glance",
                         top=bottom - 0.05, numeric={1})
         page_footer(fig, 1)
         pdf.savefig(fig)
         plt.close(fig)
 
-        # ---- page 2: global results + failure indices -------------------
+        # ---- page 2: structural response + failure indices -------------
         fig = plt.figure(figsize=(8.27, 11.69), dpi=110)
         page_head(fig)
-        global_header, global_rows = _global_rows(s, cfg.unit_system)
-        bottom = _draw_table(fig, global_header, global_rows,
-                             title="Global results", top=0.90, numeric={1})
+        response_header, response_rows = _response_rows(s, cfg.unit_system)
+        bottom = _draw_table(fig, response_header, response_rows,
+                             title="Structural response", top=0.90,
+                             numeric={1})
 
         f_header, f_rows = _failure_rows(s, u)
         if f_rows:
-            # stacked from the measured bottom of the global table, so the
-            # extra onset rows can never overlap it
+            # stacked from the measured bottom of the response table, so
+            # the table can never overlap it
             _draw_table(fig, f_header, f_rows,
                         title="Failure indices (limit = 1.0)",
-                        top=bottom - 0.055, numeric={4, 5, 6, 8})
+                        top=bottom - 0.055, numeric={4, 5, 6, 7})
         page_footer(fig, 2)
         pdf.savefig(fig)
         plt.close(fig)
 
-        # ---- page 3: load-deflection + thickness profile (vector) -------
+        # ---- page 3: model + solver and verification -------------------
+        fig = plt.figure(figsize=(8.27, 11.69), dpi=110)
+        page_head(fig)
+        model_header, model_rows = _model_rows(cfg, s, cfg.unit_system)
+        bottom = _draw_table(fig, model_header, model_rows,
+                             title="Model", top=0.90, numeric={1})
+        solver_header, solver_rows = _solver_rows(cfg, s, cfg.unit_system)
+        _draw_table(fig, solver_header, solver_rows,
+                    title="Solver and verification",
+                    top=bottom - 0.055, numeric={1})
+        page_footer(fig, 3)
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        # ---- page 4: load-deflection + thickness profile (vector) -------
         fig = plt.figure(figsize=(8.27, 11.69), dpi=110)
         page_head(fig)
         ld_ax = fig.add_axes([0.22, 0.56, 0.6, 0.32])
@@ -1038,19 +1206,19 @@ def build_pdf(results, pdf_path: str) -> str:
             prof_ax1 = fig.add_axes([0.12, 0.14, 0.30, 0.28])
             prof_ax2 = fig.add_axes([0.58, 0.14, 0.30, 0.28])
             fig_thickness_profile(results, axs=(prof_ax1, prof_ax2))
-        page_footer(fig, 3)
+        page_footer(fig, 4)
 
         pdf.savefig(fig)
         plt.close(fig)
 
-        # ---- page 4: stress along the span ------------------------------
+        # ---- page 5: stress along the span -----------------------------
         if getattr(results, "span_profile", None):
             fig = plt.figure(figsize=(8.27, 11.69), dpi=110)
             page_head(fig)
             ax1 = fig.add_axes([0.13, 0.60, 0.74, 0.28])
             ax2 = fig.add_axes([0.13, 0.16, 0.74, 0.28])
             fig_stress_along_span(results, axs=(ax1, ax2))
-            page_footer(fig, 4)
+            page_footer(fig, 5)
             pdf.savefig(fig)
             plt.close(fig)
 
@@ -1079,30 +1247,72 @@ def _visible_len(value: Any) -> int:
     return max(len(text), 2)
 
 
+TABLE_FONT_PT = 8.5
+#: Horizontal breathing room a table cell needs around its text, in
+#: pixels: it is part of the column-width budget *and* the limit the
+#: shrink pass checks, and the two must agree or cells collide.
+CELL_PAD_PX = 12.0
+
+
+def _cell_width_px(renderer, value: Any, bold: bool = False,
+                   size: float = TABLE_FONT_PT) -> float:
+    """Rendered width of one table cell, in pixels, at the table's size.
+
+    ``$...$`` cells go through matplotlib's mathtext engine and the rest
+    is plain text, so each cell is measured the way it will actually be
+    drawn. Counting characters instead (``_visible_len``) under-counts
+    mathtext badly -- the failure table's stress column came out about
+    20 px too narrow and the cells overlapped on the page.
+    """
+    from matplotlib import cbook
+    from matplotlib.font_manager import FontProperties
+
+    text = str(value)
+    prop = FontProperties(size=size, weight="bold" if bold else "normal")
+    try:
+        width, _height, _descent = renderer.get_text_width_height_descent(
+            text, prop, cbook.is_math_text(text)
+        )
+    except Exception:
+        # a cell mathtext cannot parse still needs a plausible width
+        return _visible_len(text) * size * 0.6
+    return float(width)
+
+
 def _draw_table(fig, header: List[str], rows: List[List[str]], title: str,
                 top: float, numeric: Any = frozenset()) -> float:
     """Draw a table with its upper edge just below ``top``.
 
-    Columns get widths proportional to their visible text (TeX markup
-    stripped), numeric columns are right-aligned, body rows are
-    zebra-tinted, and the *measured* bottom of the drawn table is
-    returned so the next block can be stacked underneath it without
-    colliding -- matplotlib sizes the cells itself, so only the
+    Columns get widths proportional to their *measured* rendered text
+    (mathtext measured as mathtext), numeric columns are right-aligned,
+    body rows are zebra-tinted, and the *measured* bottom of the drawn
+    table is returned so the next block can be stacked underneath it
+    without colliding -- matplotlib sizes the cells itself, so only the
     measurement after a draw is trustworthy.
     """
     n = len(rows) + 1
     est = 0.022 * n + 0.012
     bottom = max(top - est, 0.05)
-    ax = fig.add_axes([0.08, bottom, 0.84, max(top - bottom, 0.045)])
+    ax = fig.add_axes([0.05, bottom, 0.90, max(top - bottom, 0.045)])
     ax.axis("off")
-    fig.text(0.08, top + 0.012, title, fontsize=12, weight="bold",
+    fig.text(0.05, top + 0.012, title, fontsize=12, weight="bold",
              color="#2c5f8a")
 
-    widths = [_visible_len(h) for h in header]
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    ax_w_px = ax.get_window_extent(renderer).width
+
+    widths = [_cell_width_px(renderer, h, bold=True) for h in header]
     for r in rows:
         for i, c in enumerate(r):
-            widths[i] = max(widths[i], _visible_len(c))
-    weights = [max(w, 2.5) for w in widths]
+            widths[i] = max(widths[i], _cell_width_px(renderer, c))
+    # A column must hold its text *and* the padding around it, so the
+    # padding is part of the budget. Normalising on the bare text width
+    # starved the short columns (`role`, `limit`): their share came out
+    # smaller than the word itself and the cells collided with their
+    # neighbours. The same 10 px is subtracted again in the shrink pass.
+    cell_pad = CELL_PAD_PX
+    weights = [max(w, 2.5) + cell_pad for w in widths]
     total = float(sum(weights))
     col_widths = [w / total for w in weights]
 
@@ -1117,7 +1327,7 @@ def _draw_table(fig, header: List[str], rows: List[List[str]], title: str,
         colWidths=col_widths,
     )
     tab.auto_set_font_size(False)
-    tab.set_fontsize(8.5)
+    tab.set_fontsize(TABLE_FONT_PT)
     tab.scale(1, 1.35)
     for (row, col), cell in tab.get_celld().items():
         if row == 0:
@@ -1131,8 +1341,10 @@ def _draw_table(fig, header: List[str], rows: List[List[str]], title: str,
 
     # matplotlib does not clip table text, so a cell wider than its
     # column spills over the neighbours (the failure table's 36-char
-    # stress header did exactly that).  Measure the real rendered text
-    # against each column's share and shrink the font until it fits.
+    # stress header did exactly that).  The widths above already come
+    # from a measurement at the base size; this second pass catches the
+    # case where the columns as a whole are wider than the axes and
+    # shrinks the font until every cell fits its share.
     fig.canvas.draw()
     renderer = fig.canvas.get_renderer()
     ax_w_px = ax.get_window_extent(renderer).width
@@ -1143,10 +1355,39 @@ def _draw_table(fig, header: List[str], rows: List[List[str]], title: str,
             continue
         need = text.get_window_extent(renderer).width
         if need > 0:
-            # 10 px of breathing room for the cell padding
-            scale = min(scale, (col_widths[col] * ax_w_px - 10.0) / need)
+            scale = min(scale,
+                        (col_widths[col] * ax_w_px - CELL_PAD_PX) / need)
     if scale < 0.97:
-        tab.set_fontsize(max(8.5 * scale, 6.0))
+        # 5.5pt, not 6: the failure table's eight columns hold six
+        # stress components each and needs the extra room
+        tab.set_fontsize(max(TABLE_FONT_PT * scale, 5.5))
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+
+    # The uniform shrink is driven by the worst cell, so its neighbours
+    # can still end up touching theirs -- ``layer_1`` against ``core``,
+    # the six-component stress list against the hotspot column. Shrink
+    # only the cells that actually spill, by exactly what they spill,
+    # and leave everything else at the table's size.
+    margin = 4.0
+    shrunk = False
+    for cell in tab.get_celld().values():
+        text = cell.get_text()
+        if not text.get_text().strip():
+            continue
+        box = cell.get_window_extent(renderer)
+        span = text.get_window_extent(renderer)
+        deficit = (
+            max(margin - (span.x0 - box.x0), 0.0)
+            + max(margin - (box.x1 - span.x1), 0.0)
+        )
+        if deficit <= 0:
+            continue
+        width = span.width or 1.0
+        new_size = text.get_fontsize() * max(width - deficit, 0.3 * width) / width
+        text.set_fontsize(max(new_size, 4.0))
+        shrunk = True
+    if shrunk:
         fig.canvas.draw()
         renderer = fig.canvas.get_renderer()
 
@@ -1164,10 +1405,12 @@ def _draw_table(fig, header: List[str], rows: List[List[str]], title: str,
 
 
 def write_report(results, out_dir: str) -> Dict[str, str]:
-    """Write report.md, report.html and report.pdf into ``out_dir``.
+    """Write report.md, report.html, report.pdf and report.tex into ``out_dir``.
 
     All figures are (re)generated as vector PDF/SVG (plus a PNG mirror)
-    before the documents are assembled.
+    before the documents are assembled. ``report.tex`` is plain LaTeX
+    source; it is written even when no TeX distribution is installed --
+    compiling it is the reader's choice.
     """
     os.makedirs(out_dir, exist_ok=True)
     plots_dir = os.path.join(out_dir, "plots")
@@ -1181,15 +1424,19 @@ def write_report(results, out_dir: str) -> Dict[str, str]:
                 paths[f"fig_{name}_{ext}"] = path
     except Exception as exc:
         paths["figures_error"] = str(exc)
+    # build first, open second: a failure must not truncate yesterday's
+    # report and leave an empty file behind
+    md_source = build_markdown(results)
     md_path = os.path.join(out_dir, "report.md")
     with open(md_path, "w") as f:
-        f.write(build_markdown(results))
+        f.write(md_source)
     paths["report_md"] = md_path
 
     try:
+        html_source = build_html(results)
         html_path = os.path.join(out_dir, "report.html")
         with open(html_path, "w") as f:
-            f.write(build_html(results))
+            f.write(html_source)
         paths["report_html"] = html_path
     except Exception as exc:
         paths["report_html_error"] = str(exc)
@@ -1200,5 +1447,14 @@ def write_report(results, out_dir: str) -> Dict[str, str]:
         )
     except Exception as exc:
         paths["report_pdf_error"] = str(exc)
+
+    try:
+        tex_source = build_latex(results)
+        tex_path = os.path.join(out_dir, "report.tex")
+        with open(tex_path, "w") as f:
+            f.write(tex_source)
+        paths["report_tex"] = tex_path
+    except Exception as exc:
+        paths["report_tex_error"] = str(exc)
 
     return paths

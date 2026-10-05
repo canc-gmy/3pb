@@ -158,6 +158,19 @@ class TestReportsShareTheSameMath:
         assert "<script" not in html
         assert "<link" not in html
 
+    def test_html_header_units_are_rendered_maths(self):
+        r"""Column-header units must be typeset, not printed as the raw
+        ``\mathrm{m}`` that an un-delimited symbol produces."""
+        html = build_html(FakeResults(make_config(), "."))
+        # text content only: the TeX lives in ``alt`` attributes and in
+        # the inlined SVG payloads, never as something a reader sees
+        text_only = re.sub(r"<[^>]*>", "", html)
+        assert r"\mathrm" not in text_only
+        # the unit *is* there, as an inlined image with the TeX as alt text
+        assert 'alt="\\mathrm{m}"' in html
+        assert 'alt="\\mathrm{Pa}"' in html
+        assert '<img class="math"' in html
+
     def test_html_marks_predicted_onset(self):
         view = FakeResults(make_config(), ".")
         view.summary["failure_onset"] = {
@@ -177,7 +190,8 @@ class TestReportsShareTheSameMath:
         rows = re.findall(r'<tr class="failure">(.*?)</tr>', html, flags=re.S)
         assert len(rows) == 1
         assert rows[0].startswith("<td>layer_0</td>")
-        assert rows[0].count("<td") == 10
+        # 8 columns: the two per-row ``unit`` cells became header maths
+        assert rows[0].count("<td") == 8
         assert rows[0].endswith("</td>")
 
     def test_html_is_self_contained_without_plot_files(self):

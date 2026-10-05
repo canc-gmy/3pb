@@ -206,7 +206,7 @@ def _cmd_report(args: argparse.Namespace) -> int:
 
     view = _load_case_dir(args.case_dir)
     paths = write_report(view, args.case_dir)
-    for key in ("report_md", "report_html", "report_pdf"):
+    for key in ("report_md", "report_html", "report_pdf", "report_tex"):
         if key in paths:
             print(f"{key}: {paths[key]}")
     for key in paths:
@@ -236,7 +236,7 @@ def main(argv=None) -> int:
         description=(
             "Three-point bending of composite sandwich beams with "
             "FEniCSx/DOLFINx: rigid-roller contact, failure indices and "
-            "Markdown/HTML/PDF reporting."
+            "Markdown/HTML/PDF/LaTeX reporting."
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True)

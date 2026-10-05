@@ -23,11 +23,55 @@ from __future__ import annotations
 import base64
 import re
 from functools import lru_cache
+from typing import List, Tuple
 
 #: ``$...$`` runs of TeX. The delimiters must not sit flush against an
 #: alphanumeric on either side, so prose that merely mentions money
 #: ("costs $5 and $6") is not mistaken for a pair of math spans.
 _MATH = re.compile(r"(?<![0-9A-Za-z])\$([^$\n]+)\$(?![0-9A-Za-z])")
+
+
+def latex_escape(text: str) -> str:
+    r"""Escape ``text`` for LaTeX, leaving ``$...$`` mathematics alone.
+
+    The report writers emit prose and TeX in the same cell -- ``Tsai-Wu
+    index $\frac{\vert\tau_{xz}}{\tau_c}$`` -- so escaping the whole cell
+    would turn every formula into $\verb|\{\}|$ soup, while escaping
+    nothing would break on the first ``&`` or ``%`` in prose. This
+    splits on the same maths pattern :data:`_MATH` the renderers use,
+    escapes only the prose runs, and translates the typographic
+    characters matplotlib likes but pdfLaTeX only accepts as commands.
+    """
+
+    def _plain(chunk: str) -> str:
+        for char, replacement in _LATEX_TEXT:
+            chunk = chunk.replace(char, replacement)
+        return chunk
+
+    out: List[str] = []
+    position = 0
+    for match in _MATH.finditer(text):
+        out.append(_plain(text[position:match.start()]))
+        out.append(match.group(0))
+        position = match.end()
+    out.append(_plain(text[position:]))
+    return "".join(out)
+
+
+#: Prose-only substitutions, applied outside ``$...$``.
+_LATEX_TEXT: Tuple[str, str] = (
+    ("&", r"\&"),
+    ("%", r"\%"),
+    ("#", r"\#"),
+    ("_", r"\_"),
+    ("{", r"\{"),
+    ("}", r"\}"),
+    ("~", r"\textasciitilde{}"),
+    ("^", r"\textasciicircum{}"),
+    ("—", "---"),
+    ("–", "--"),
+    ("·", r"\textperiodcentered{}"),
+)
 
 
 def tex(source: str) -> str:

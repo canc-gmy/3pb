@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sandwich3pb"
 version = "0.1.0"
-description = "3D three-point bending simulation of composite sandwich beams with FEniCSx/DOLFINx: rigid-roller contact, failure indices, and Markdown/HTML/PDF reporting."
+description = "3D three-point bending simulation of composite sandwich beams with FEniCSx/DOLFINx: rigid-roller contact, failure indices, and Markdown/HTML/PDF/LaTeX reporting."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

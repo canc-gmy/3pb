@@ -1,17 +1,22 @@
 """Tests for report generation (no FEM required)."""
 
 import os
+import re
+import shutil
+import subprocess
 
 import numpy as np
 import pytest
 
 from sandwich3pb.report import (
     _failure_rows,
-    _global_rows,
     _kpi_rows,
     _layup_rows,
     _md_table,
     _model_rows,
+    _response_rows,
+    _solver_rows,
+    build_latex,
     build_markdown,
 )
 from tests.conftest import make_config
@@ -72,46 +77,54 @@ def test_layup_rows_include_orientation(tmp_path):
     cfg = make_config()
     header, rows = _layup_rows(cfg)
     assert any("fibre orientation" in h for h in header)
-    assert rows[1][5] == "$0$"  # core has no orientation value of interest
+    assert rows[1][4] == "$0$"  # core has no orientation value of interest
     assert rows[0][2] == "glass_epoxy"
 
 
 def test_layup_units_follow_the_case_file():
-    """Unit cells must announce the case file's units, not the internal ones."""
+    """The columnar tables announce their unit in the *header*, in the
+    case file's units -- never in a repeated ``unit`` cell and never as
+    bare, undelimited TeX."""
     from sandwich3pb.units import MM_N_MPA
 
     cfg = make_config()
     header, si_rows = _layup_rows(cfg)
-    assert header[4] == header[7] == "unit"
-    si_units = [si_rows[0][4], si_rows[0][7]]
-    assert any(r"\mathrm{m}" in c for c in si_units)   # SI default
-    assert any(r"\mathrm{Pa}" in c for c in si_units)
-    assert not any(r"\mathrm{mm}" in c for c in si_units)
+    assert not any(str(h) == "unit" for h in header)
+    assert r"$\mathrm{m}$" in header[3]          # thickness column, SI
+    assert r"$\mathrm{Pa}$" in header[5]         # E_x column, SI
+    assert not any(r"mm" in str(h) for h in header)
+    # ...and no row cell smuggles a unit in
+    for row in si_rows:
+        assert not any(r"\mathrm" in str(cell) for cell in row), row
 
     cfg.units = MM_N_MPA.name
-    _, mm_rows = _layup_rows(cfg)
-    mm_units = [mm_rows[0][4], mm_rows[0][7]]
-    assert any(r"\mathrm{mm}" in c for c in mm_units)
-    assert any(r"\mathrm{MPa}" in c for c in mm_units)
+    mm_header, _ = _layup_rows(cfg)
+    assert r"$\mathrm{mm}$" in mm_header[3]
+    assert r"$\mathrm{MPa}$" in mm_header[5]
 
 
 def test_layup_rows_show_90deg(tmp_path):
     cfg = make_config()
     cfg.stackup[0].fibre_orientation = 90.0
     _, rows = _layup_rows(cfg)
-    assert rows[0][5] == "$90$"
+    assert rows[0][4] == "$90$"
 
 
-def test_global_rows_contain_rigidity():
+def test_response_rows_contain_rigidity():
     cfg = make_config()
     view = FakeResults(cfg, ".")
-    _, rows = _global_rows(view.summary, cfg.unit_system)
+    _, rows = _response_rows(view.summary, cfg.unit_system)
     flat = " | ".join(cell for r in rows for cell in r)
     assert "flexural rigidity" in flat
     assert "force gradient" in flat
+    # the duplicated rows are gone: one deflection, one force
+    labels = [str(r[0]) for r in rows]
+    assert not any(label.startswith("deflection at max force") for label in labels)
+    assert not any(label.startswith("final roller travel") for label in labels)
+    assert not any(label.startswith("load-roller force") for label in labels)
 
 
-def test_global_rows_convert_to_case_units():
+def test_response_rows_convert_to_case_units():
     """Internal mm/N/MPa values must be presented in the case file's units,
     with the unit sitting in its own column beside the value."""
     from sandwich3pb.units import MM_N_MPA
@@ -122,39 +135,45 @@ def test_global_rows_convert_to_case_units():
     def row_in(rows, prefix):
         return next(r for r in rows if str(r[0]).startswith(prefix))
 
-    _, si = _global_rows(view.summary, cfg.unit_system)
+    _, si = _response_rows(view.summary, cfg.unit_system)
     # 1200.5 N: N is the force unit in both systems
     force = row_in(si, "max force")
     assert force[1] == r"$1200$" and force[2] == r"$\mathrm{N}$"
     # 2.5e8 N*mm^2 -> 250 N*m^2 in SI
     rigidity = row_in(si, "apparent flexural rigidity")
     assert rigidity[1] == r"$250$" and rigidity[2] == r"$\mathrm{N\,m^{2}}$"
-    # 0.8 mm -> 8e-4 m (below the readability threshold, so scientific)
-    deflection = row_in(si, "deflection at max force")
-    assert deflection[1] == r"$8\times 10^{-4}$"
+    deflection = row_in(si, "max deflection")
+    assert deflection[1] == r"$0.001$"
     assert deflection[2] == r"$\mathrm{m}$"
 
+    # a sub-micron quantity switches to scientific TeX, not e-07
+    _, solver_si = _solver_rows(cfg, view.summary, cfg.unit_system)
+    penetration = row_in(solver_si, "peak contact penetration")
+    assert penetration[1] == r"$6\times 10^{-7}$"
+    assert penetration[2] == r"$\mathrm{m}$"
+
     cfg.units = MM_N_MPA.name
-    _, mm = _global_rows(view.summary, cfg.unit_system)
+    _, mm = _response_rows(view.summary, cfg.unit_system)
     flat_mm = " | ".join(c for r in mm for c in r)
-    deflection = row_in(mm, "deflection at max force")
-    assert deflection[1] == "$0.8$" and deflection[2] == r"$\mathrm{mm}$"
+    deflection = row_in(mm, "max deflection")
+    assert deflection[1] == "$1$" and deflection[2] == r"$\mathrm{mm}$"
     rigidity = row_in(mm, "apparent flexural rigidity")
+    assert rigidity[1] == r"$2.5\times 10^{8}$"
     assert rigidity[2] == r"$\mathrm{N\,mm^{2}}$"
     assert r"\mathrm{m}$" not in flat_mm
 
 
-def test_global_rows_use_tex_for_scientific_stress():
+def test_response_rows_use_tex_for_scientific_stress():
     """Large SI magnitudes become ``\\times 10^{n}``, never ``e+07``."""
     from sandwich3pb.units import SI
 
     view = FakeResults(make_config(), ".")
-    view.summary["load_roller_force_N"] = 6.7e7
-    _, rows = _global_rows(view.summary, SI)
+    view.summary["max_force_N"] = 6.7e7
+    _, rows = _response_rows(view.summary, SI)
     flat = " | ".join(c for r in rows for c in r)
-    roller = next(r for r in rows if str(r[0]).startswith("load-roller force"))
-    assert roller[1] == r"$6.7\times 10^{7}$"
-    assert roller[2] == r"$\mathrm{N}$"
+    peak = next(r for r in rows if str(r[0]).startswith("max force"))
+    assert peak[1] == r"$6.7\times 10^{7}$"
+    assert peak[2] == r"$\mathrm{N}$"
     assert "e+07" not in flat
 
 
@@ -172,11 +191,18 @@ def test_failure_rows_cover_all_layers():
     view = FakeResults(cfg, ".")
     header, rows = _failure_rows(view.summary)
     assert len(rows) == 4  # 2 faces + 2 core criteria
-    assert len(header) == 10
+    # 8 columns: the two per-row ``unit`` cells moved into the headers
+    assert len(header) == 8
+    assert all(len(r) == 8 for r in rows)
     assert any("Tsai-Wu" in r[3] for r in rows)
+    # the old header glued the unit onto the Voigt indices
+    assert not any("11,\\mathrm" in h for h in header)
+    assert r"\sigma_{11}" in header[7]
+    assert r"$\mathrm{" in header[6]      # hotspot unit
+    assert r"$\mathrm{" in header[7]      # stress unit
 
 
-def test_failure_onset_is_highlighted_in_markdown_and_global_table():
+def test_failure_onset_is_highlighted_in_markdown_and_response_table():
     cfg = make_config()
     view = FakeResults(cfg, ".")
     view.summary["failure_onset"] = {
@@ -186,7 +212,12 @@ def test_failure_onset_is_highlighted_in_markdown_and_global_table():
     md = build_markdown(view)
     assert "Predicted first failure — step 3" in md
     assert "layer_1:shear" in md
-    _, rows = _global_rows(view.summary, cfg.unit_system)
+    # headline (a deliberate promotion of the table row), the response
+    # table's one onset row, and the detailed callout -- the five onset
+    # rows that used to repeat it in the table are gone
+    assert md.lower().count("predicted first failure") == 3
+    assert "onset travel" not in md and "onset criterion" not in md
+    _, rows = _response_rows(view.summary, cfg.unit_system)
     step_row = next(
         row for row in rows
         if str(row[0]).startswith("predicted first failure")
@@ -200,9 +231,13 @@ def test_markdown_renders_all_sections(tmp_path):
     cfg = make_config()
     view = FakeResults(cfg, str(tmp_path))
     md = build_markdown(view)
-    for section in ("Layup / stackup", "Model", "Global results",
-                    "Failure indices", "Load–deflection"):
+    for section in ("Layup / stackup", "Model", "Structural response",
+                    "Failure indices", "Solver and verification",
+                    "Load–deflection"):
         assert section in md
+    # run health is a status line, not a trailing section of its own
+    assert "## Convergence" not in md
+    assert "**Run:** all steps converged" in md
     assert "fibre orientation" in md
     # markdown table syntax present
     assert "| --- |" in md or "|---|" in md.replace(" ", "")
@@ -216,16 +251,17 @@ def test_md_table_format():
 
 
 def test_values_and_units_live_in_separate_columns():
-    """No value cell may carry the unit: units belong to the unit column."""
+    """Units belong beside the value (key-value tables) or in the column
+    header (columnar tables) -- never glued into the value itself."""
     cfg = make_config()
     view = FakeResults(cfg, ".")
-    tables = [
-        _layup_rows(cfg),
+
+    key_value = [
         _model_rows(cfg, view.summary),
-        _global_rows(view.summary, cfg.unit_system),
-        _failure_rows(view.summary, cfg.unit_system),
+        _response_rows(view.summary, cfg.unit_system),
+        _solver_rows(cfg, view.summary, cfg.unit_system),
     ]
-    for header, rows in tables:
+    for header, rows in key_value:
         unit_cols = [i for i, h in enumerate(header) if h == "unit"]
         assert unit_cols, header
         for row in rows:
@@ -235,6 +271,16 @@ def test_values_and_units_live_in_separate_columns():
                     continue
                 # fmt_tex_qty glues value and unit with "\\," -- never here
                 assert "\\," not in str(value), (header, row)
+
+    columnar = [_layup_rows(cfg),
+                _failure_rows(view.summary, cfg.unit_system)]
+    for header, rows in columnar:
+        assert not any(str(h) == "unit" for h in header), header
+        unit_headers = [h for h in header if r"$\mathrm{" in str(h)]
+        assert unit_headers, header          # every unit is delimited math
+        for row in rows:
+            assert len(row) == len(header)
+            assert not any(r"\\mathrm" in str(c) for c in row), row
 
 
 def test_kpi_rows_pick_headline_numbers():
@@ -263,3 +309,142 @@ def test_visible_len_strips_inline_math():
     assert _visible_len(r"$\mathrm{MPa}$") == 3
     assert _visible_len("layer_1") == 7
     assert _visible_len("—") == 2
+
+
+# --------------------------------------------------------------------------
+# content rules: TeX where it belongs, prose where it doesn't
+# --------------------------------------------------------------------------
+
+
+def test_markdown_kpi_block_is_a_real_table():
+    """A GFM table needs a header *and* a delimiter row; without them
+    the headline block renders as literal pipe text."""
+    md = build_markdown(FakeResults(make_config(), "."))
+    block = md.split("**At a glance:**", 1)[1].split("##", 1)[0]
+    lines = [l for l in block.strip().splitlines() if l.startswith("|")]
+    assert len(lines) >= 3, lines
+    assert "quantity" in lines[0] and "value" in lines[0]
+    assert re.fullmatch(r"\|[\s:|-]+\|", lines[1]), lines[1]
+
+
+def test_no_raw_tex_outside_math_in_markdown():
+    r"""Unit symbols are wrapped, never printed as bare ``\mathrm{m}``."""
+    md = build_markdown(FakeResults(make_config(), "."))
+    for line in md.splitlines():
+        prose = re.sub(r"\$[^$\n]+\$", "", line)
+        assert r"\mathrm" not in prose, line
+        assert r"\times" not in prose, line
+
+
+def test_boolean_and_counts_stay_prose():
+    """``yes``/``no`` and step counts are words, not mathematics."""
+    cfg = make_config()
+    view = FakeResults(cfg, ".")
+    header, rows = _model_rows(cfg, view.summary)
+    assert "unit" in header          # key-value tables keep the column
+    flat = " | ".join(str(c) for r in rows for c in r)
+    assert "$yes$" not in flat and "$no$" not in flat
+
+    half = next(r for r in rows if str(r[0]).startswith("half model"))
+    assert half[1] == "no" and half[2] == "—"
+    steps = next(r for r in rows if str(r[0]).startswith("load steps"))
+    assert steps[1] == "5"
+    assert any("element order" in str(r[0]) for r in rows)
+
+
+def test_dropped_duplicate_rows_are_nowhere_in_the_report():
+    cfg = make_config()
+    view = FakeResults(cfg, ".")
+    view.summary.update(
+        deflection_at_max_force_mm=1.0,
+        final_travel_mm=1.0,
+        load_roller_force_N=1200.5,
+        n_failed_steps=0,
+        max_contact_penetration_mm=4e-4,
+    )
+    md = build_markdown(view)
+    for dropped in (
+        "deflection at max force",
+        "final roller travel",
+        "load-roller force",
+        "failed load steps",
+        "final-step contact penetration",
+        "## Convergence",
+    ):
+        assert dropped not in md, dropped
+
+
+# --------------------------------------------------------------------------
+# report.tex
+# --------------------------------------------------------------------------
+
+
+def test_report_tex_makes_numeric_lists_breakable():
+    r"""TeX cannot break a line inside ``$0.1, -0.02, 0.0015$``, so a
+    ``p{}`` column holding one spills over its neighbour. The exporter
+    must put the separating commas back into text mode."""
+    from sandwich3pb.report import _breakable_math
+
+    broken = _breakable_math(r"$0.1, -0.02, 0.0015$")
+    assert broken == r"$0.1$, $-0.02$, $0.0015$"
+    scientific = _breakable_math(
+        r"$8.031\times 10^{7}, 5.781\times 10^{6}$"
+    )
+    assert scientific == r"$8.031\times 10^{7}$, $5.781\times 10^{6}$"
+    # a single quantity is left alone, and so are commas *inside* braces
+    assert _breakable_math(r"$0.0015$") == r"$0.0015$"
+    assert _breakable_math(r"$\frac{a, b}{c}$") == r"$\frac{a, b}{c}$"
+    assert _breakable_math(r"no maths, here") == r"no maths, here"
+
+
+def test_report_tex_is_valid_latex_source():
+    r"""The exporter must emit LaTeX, with its mathematics untouched.
+
+    The previous version escaped the whole cell (``$E_x$`` became
+    ``$E\_x$``), emitted Markdown ``##`` headings and put ``\title``
+    after ``\begin{document}``.
+    """
+    cfg = make_config()
+    view = FakeResults(cfg, ".")
+    tex_src = build_latex(view)
+
+    assert tex_src.index(r"\title") < tex_src.index(r"\begin{document}")
+    assert tex_src.index(r"\maketitle") > tex_src.index(r"\begin{document}")
+    assert "\n## " not in tex_src
+    for section in ("At a glance", "Layup / stackup", "Structural response",
+                    "Failure indices", "Model", "Solver and verification"):
+        assert rf"\section*{{{section}}}" in tex_src
+
+    # maths survives: single backslash rules, no blanket escaping
+    for line in tex_src.splitlines():
+        if re.search(r"(top|mid|bottom)rule", line):
+            assert "\\\\" not in line, line
+    assert r"\mathrm\{" not in tex_src
+    assert r"E\_x" not in tex_src
+    assert r"\times 10^{" in tex_src
+    assert r"$\mathrm{Pa}$" in tex_src
+    # ...while prose *is* escaped
+    assert r"test\_case" in tex_src
+    # figures are PDFs, guarded so a missing plot is not an error
+    assert r"\IfFileExists{plots/" in tex_src
+    assert ".svg" not in tex_src
+    # numeric lists are split so the columns can wrap
+    assert r"$600.2$, $600.3$" in tex_src      # support reactions
+    assert r"$600.2, 600.3$" not in tex_src
+
+
+PDFLATEX = shutil.which("pdflatex")
+
+
+@pytest.mark.skipif(PDFLATEX is None, reason="pdflatex not installed")
+def test_report_tex_compiles(tmp_path):
+    """The written source must actually produce a PDF."""
+    view = FakeResults(make_config(), str(tmp_path))
+    (tmp_path / "report.tex").write_text(build_latex(view))
+    result = subprocess.run(
+        [PDFLATEX, "-interaction=nonstopmode", "-halt-on-error",
+         "report.tex"],
+        cwd=tmp_path, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout[-4000:]
+    assert (tmp_path / "report.pdf").read_bytes().startswith(b"%PDF")
